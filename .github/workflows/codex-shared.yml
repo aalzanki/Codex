@@ -362,12 +362,13 @@ jobs:
 
             # macOS runners can still be on Bash 3.x (no `readarray`), so parse via a single
             # Python call + line extraction.
-            workflow_claims="$(python3 - <<'PY' < "$oidc_body"
+          workflow_claims="$(python3 - "$oidc_body" <<'PY'
           import base64
           import json
           import sys
 
-          raw = sys.stdin.read()
+          oidc_body = sys.argv[1]
+          raw = open(oidc_body, "r", encoding="utf-8").read()
           if not raw.strip():
             raise SystemExit("OIDC token response is empty")
 
@@ -408,7 +409,7 @@ jobs:
           print(called_workflow_ref)
           print(called_workflow_sha)
           PY
-            )"
+          )"
 
           called_workflow_ref="$(printf '%s' "$workflow_claims" | sed -n '1p')"
           called_workflow_sha="$(printf '%s' "$workflow_claims" | sed -n '2p')"
