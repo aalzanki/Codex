@@ -309,22 +309,58 @@ jobs:
         run: |
           set -euo pipefail
 
-          # The shared checkout implementation lives in the workflow repository (this repo).
-          # Fetch it by parsing the workflow ref so we don't hardcode a specific owner/repo.
-          workflow_ref="${GITHUB_WORKFLOW_REF:-}"
-          workflow_sha="${GITHUB_WORKFLOW_SHA:-}"
-          if [ -z "$workflow_ref" ]; then
-            echo "::error::GITHUB_WORKFLOW_REF is empty; cannot locate shared checkout script."
+          # The shared checkout implementation lives in the reusable workflow repository (this repo).
+          #
+          # For reusable workflows, the default `github.*` context (and `GITHUB_*` env vars like
+          # `GITHUB_WORKFLOW_REF`) point at the *caller* repo, not the called workflow repo. That
+          # breaks unauthenticated fetches when the caller is private.
+          #
+          # Instead, derive the called workflow repo/ref from the job's OIDC token claims:
+          # - `job_workflow_ref`: "<owner>/<repo>/.github/workflows/<file>.yml@<ref>"
+          # - `job_workflow_sha`: commit SHA of the called workflow file
+          if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+            echo "::error::OIDC env vars missing; ensure job permissions include 'id-token: write'."
+            exit 1
+          fi
+          oidc_url="${ACTIONS_ID_TOKEN_REQUEST_URL}"
+          if printf '%s' "$oidc_url" | grep -q '?'; then
+            oidc_url="${oidc_url}&audience=codex-shared"
+          else
+            oidc_url="${oidc_url}?audience=codex-shared"
+          fi
+          oidc_json="$(curl -sSf -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" "$oidc_url")"
+
+          readarray -t workflow_claims < <(printf '%s' "$oidc_json" | python3 - <<'PY'
+          import base64
+          import json
+          import sys
+
+          data = json.loads(sys.stdin.read() or "{}")
+          token = (data.get("value") or "").strip()
+          if not token:
+            raise SystemExit("OIDC token response missing .value")
+          parts = token.split(".")
+          if len(parts) < 2:
+            raise SystemExit("OIDC token is not a JWT")
+          payload_b64 = parts[1]
+          payload_b64 += "=" * (-len(payload_b64) % 4)
+          payload = base64.urlsafe_b64decode(payload_b64.encode("utf-8")).decode("utf-8")
+          claims = json.loads(payload)
+          print((claims.get("job_workflow_ref") or "").strip())
+          print((claims.get("job_workflow_sha") or "").strip())
+          PY
+          )
+
+          job_workflow_ref="${workflow_claims[0]:-}"
+          job_workflow_sha="${workflow_claims[1]:-}"
+          if [ -z "$job_workflow_ref" ] || [ -z "$job_workflow_sha" ]; then
+            echo "::error::Unable to resolve job_workflow_ref/job_workflow_sha from OIDC token; cannot locate shared checkout script."
             exit 1
           fi
 
-          workflow_repo_path="${workflow_ref%@*}"
+          workflow_repo_path="${job_workflow_ref%@*}"
           workflow_repo="$(printf '%s' "$workflow_repo_path" | cut -d/ -f1-2)"
-          ref="${workflow_sha:-${workflow_ref#*@}}"
-          case "$ref" in
-            refs/heads/*) ref="${ref#refs/heads/}" ;;
-            refs/tags/*) ref="${ref#refs/tags/}" ;;
-          esac
+          ref="$job_workflow_sha"
 
           checkout_script="${RUNNER_TEMP}/self-hosted-checkout.sh"
           script_url="https://raw.githubusercontent.com/${workflow_repo}/${ref}/.github/scripts/self-hosted-checkout.sh"
