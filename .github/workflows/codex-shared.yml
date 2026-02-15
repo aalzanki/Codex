@@ -328,17 +328,26 @@ jobs:
           else
             oidc_url="${oidc_url}?audience=codex-shared"
           fi
-          oidc_json="$(curl -sSf -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" "$oidc_url")"
+          oidc_json="$(curl -sSf -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" -H "Accept: application/json" "$oidc_url")"
 
-          readarray -t workflow_claims < <(printf '%s' "$oidc_json" | python3 - <<'PY'
+          # macOS runners can still be on Bash 3.x (no `readarray`), so parse via a single
+          # Python call + line extraction.
+          workflow_claims="$(printf '%s' "$oidc_json" | python3 - <<'PY'
           import base64
           import json
           import sys
 
           data = json.loads(sys.stdin.read() or "{}")
-          token = (data.get("value") or "").strip()
+          if not isinstance(data, dict):
+            raise SystemExit("OIDC token response is not a JSON object")
+          token = (
+            (data.get("value") or "")
+            or (data.get("token") or "")
+            or (data.get("id_token") or "")
+          ).strip()
           if not token:
-            raise SystemExit("OIDC token response missing .value")
+            keys = sorted(list(data.keys()))
+            raise SystemExit(f"OIDC token response missing token field (keys: {keys})")
           parts = token.split(".")
           if len(parts) < 2:
             raise SystemExit("OIDC token is not a JWT")
@@ -349,10 +358,10 @@ jobs:
           print((claims.get("job_workflow_ref") or "").strip())
           print((claims.get("job_workflow_sha") or "").strip())
           PY
-          )
+          )"
 
-          job_workflow_ref="${workflow_claims[0]:-}"
-          job_workflow_sha="${workflow_claims[1]:-}"
+          job_workflow_ref="$(printf '%s' "$workflow_claims" | sed -n '1p')"
+          job_workflow_sha="$(printf '%s' "$workflow_claims" | sed -n '2p')"
           if [ -z "$job_workflow_ref" ] || [ -z "$job_workflow_sha" ]; then
             echo "::error::Unable to resolve job_workflow_ref/job_workflow_sha from OIDC token; cannot locate shared checkout script."
             exit 1
