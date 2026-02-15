@@ -683,12 +683,172 @@ jobs:
               return activeCandidate;
             };
 
+            const MAX_BODY_REFERENCE_CANDIDATES = 12;
+
+            const collectReferencedIssueNumbers = (text, repoSlug) => {
+              const normalized = typeof text === 'string' ? text : '';
+              if (!normalized.trim()) {
+                return [];
+              }
+
+              const repoSlugNormalized =
+                typeof repoSlug === 'string' ? repoSlug.toLowerCase() : '';
+
+              const candidates = [];
+              const seen = new Set();
+
+              const pushNumber = (value) => {
+                if (!Number.isFinite(value) || value <= 0) {
+                  return;
+                }
+                if (seen.has(value)) {
+                  return;
+                }
+                seen.add(value);
+                candidates.push(value);
+              };
+
+              // Prefer explicit references like "refs #2785" in the PR description.
+              const keywordRegex =
+                /\b(?:ref|refs|reference|references|related|relates|fix|fixes|fixed|close|closes|closed|closing|resolve|resolves|resolved|address|addresses|addressed)\b[^\S\r\n]*[:=-]?[^\S\r\n]*#(\d+)\b/gi;
+              let match = null;
+              while ((match = keywordRegex.exec(normalized))) {
+                pushNumber(Number.parseInt(match[1], 10));
+              }
+
+              // Also support repo-qualified references ("owner/repo#123"), but only when it matches this repo.
+              const repoQualifiedRegex =
+                /\b([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)#(\d+)\b/g;
+              while ((match = repoQualifiedRegex.exec(normalized))) {
+                if (!repoSlugNormalized) {
+                  continue;
+                }
+                if (String(match[1]).toLowerCase() !== repoSlugNormalized) {
+                  continue;
+                }
+                pushNumber(Number.parseInt(match[2], 10));
+              }
+
+              // Fallback to any "#123" mentions.
+              const bareRegex = /#(\d+)\b/g;
+              while ((match = bareRegex.exec(normalized))) {
+                pushNumber(Number.parseInt(match[1], 10));
+              }
+
+              return candidates.slice(0, MAX_BODY_REFERENCE_CANDIDATES);
+            };
+
+            const resolvePullRequestBody = async ({
+              github,
+              owner,
+              repo,
+              pullNumber,
+            }) => {
+              const payloadBody =
+                typeof context.payload.pull_request?.body === 'string'
+                  ? context.payload.pull_request.body
+                  : typeof context.payload.issue?.body === 'string'
+                    ? context.payload.issue.body
+                    : '';
+
+              if (payloadBody && payloadBody.trim()) {
+                return payloadBody;
+              }
+
+              try {
+                const pr = await github.rest.pulls.get({
+                  owner,
+                  repo,
+                  pull_number: pullNumber,
+                });
+                return typeof pr.data.body === 'string' ? pr.data.body : '';
+              } catch (error) {
+                core.warning(
+                  `Unable to fetch PR body for PR #${pullNumber}: ${error.message}`
+                );
+                return payloadBody || '';
+              }
+            };
+
+            const resolveOpenIssueFromReferences = async ({
+              github,
+              owner,
+              repo,
+              candidateNumbers,
+            }) => {
+              if (!Array.isArray(candidateNumbers) || candidateNumbers.length === 0) {
+                return null;
+              }
+
+              const limit = Math.min(
+                candidateNumbers.length,
+                MAX_BODY_REFERENCE_CANDIDATES
+              );
+
+              for (let index = 0; index < limit; index += 1) {
+                const issueNumber = candidateNumbers[index];
+                try {
+                  const response = await github.rest.issues.get({
+                    owner,
+                    repo,
+                    issue_number: issueNumber,
+                  });
+                  const issue = response?.data || {};
+                  if (issue.pull_request) {
+                    continue;
+                  }
+                  if (String(issue.state || '').toUpperCase() !== OPEN_STATE) {
+                    continue;
+                  }
+                  return {
+                    number:
+                      typeof issue.number === 'number' ? issue.number : issueNumber,
+                    url: typeof issue.html_url === 'string' ? issue.html_url : '',
+                  };
+                } catch (error) {
+                  core.debug(
+                    `Skipping referenced candidate #${issueNumber}: ${error.message}`
+                  );
+                }
+              }
+
+              return null;
+            };
+
             const resolvePullRequestLinkedIssue = async ({
               github,
               owner,
               repo,
               pullNumber,
             }) => {
+              const repoSlug = `${owner}/${repo}`;
+              const body = await resolvePullRequestBody({
+                github,
+                owner,
+                repo,
+                pullNumber,
+              });
+              const referencedNumbers = collectReferencedIssueNumbers(body, repoSlug);
+              if (referencedNumbers.length > 0) {
+                core.info(
+                  `🧩 PR description referenced candidates: ${referencedNumbers
+                    .map((number) => `#${number}`)
+                    .join(', ')}`
+                );
+              }
+              const issueFromBody = await resolveOpenIssueFromReferences({
+                github,
+                owner,
+                repo,
+                candidateNumbers: referencedNumbers,
+              });
+              if (issueFromBody) {
+                core.info(
+                  `🧩 Linked issue resolved from PR description: Issue #${issueFromBody.number}`
+                );
+                return issueFromBody;
+              }
+
               const response = await github.graphql(PULL_REQUEST_LINKED_ISSUES_QUERY, {
                 owner,
                 repo,
@@ -698,7 +858,7 @@ jobs:
 
               const pullRequestNode = response?.repository?.pullRequest ?? null;
               const candidates = collectPullRequestLinkedIssues(pullRequestNode);
-              return selectActivePullRequestLinkedIssue(candidates, `${owner}/${repo}`);
+              return selectActivePullRequestLinkedIssue(candidates, repoSlug);
             };
 
             const MAX_OLDER_COMMENTS = 28;
