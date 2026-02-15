@@ -31,8 +31,12 @@ test("codex-shared checkout uses ephemeral extraheader git auth", () => {
   const workflow = fs.readFileSync(workflowPath, "utf8");
 
   assert.ok(
-    workflow.includes("GITHUB_WORKFLOW_REF"),
-    "Expected codex-shared workflow to derive the shared checkout script location from GITHUB_WORKFLOW_REF."
+    workflow.includes("ACTIONS_ID_TOKEN_REQUEST_URL"),
+    "Expected codex-shared workflow to use OIDC job_workflow_ref/job_workflow_sha to locate the shared checkout script."
+  );
+  assert.ok(
+    workflow.includes("job_workflow_ref"),
+    "Expected codex-shared workflow to read job_workflow_ref from the OIDC token."
   );
   assert.ok(
     workflow.includes(".github/scripts/self-hosted-checkout.sh"),
