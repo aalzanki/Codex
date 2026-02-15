@@ -20,12 +20,24 @@ test("codex-shared prompt wording stays consistent with Issue/PR labels", () => 
   );
 
   assert.ok(
-    workflow.includes("PR's latest comments"),
-    "Expected workflow to label PR comment sections as \"PR's latest comments\"."
+    workflow.includes("Associated PR"),
+    'Expected workflow to include "Associated PR" section headings.'
   );
   assert.ok(
-    workflow.includes("Issue's latest comments"),
-    "Expected workflow to label issue comment sections as \"Issue's latest comments\"."
+    workflow.includes("Associated Issue"),
+    'Expected workflow to include "Associated Issue" section headings.'
+  );
+  assert.ok(
+    workflow.includes("Triggering PR"),
+    'Expected workflow to include "Triggering PR" section headings.'
+  );
+  assert.ok(
+    workflow.includes("Triggering Issue"),
+    'Expected workflow to include "Triggering Issue" section headings.'
+  );
+  assert.ok(
+    workflow.includes("Latest comments:"),
+    'Expected workflow to label comment blocks as "Latest comments:".'
   );
 
   const bannedPhrases = [

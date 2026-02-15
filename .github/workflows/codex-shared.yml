@@ -872,6 +872,14 @@ jobs:
               return normalized.slice(0, maxChars) + '...';
             };
 
+            const DESCRIPTION_CHAR_LIMIT = 12000;
+            const truncateDescription = (text, maxChars) => {
+              if (!text) return '';
+              const normalized = String(text);
+              if (normalized.length <= maxChars) return normalized;
+              return normalized.slice(0, maxChars) + '\n\n...(truncated)...';
+            };
+
             const fetchIssueComments = async (issueNumber) =>
               github.paginate(github.rest.issues.listComments, {
                 owner: context.repo.owner,
@@ -879,6 +887,27 @@ jobs:
                 issue_number: issueNumber,
                 per_page: 100
               });
+
+            const fetchThreadDetails = async (issueNumber) => {
+              try {
+                const issue = await github.rest.issues.get({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issueNumber,
+                });
+
+                return {
+                  title: issue.data.title || '',
+                  body: issue.data.body || '',
+                  url: issue.data.html_url || '',
+                };
+              } catch (error) {
+                core.warning(
+                  `Unable to fetch details for #${issueNumber}: ${error.message}`
+                );
+                return { title: '', body: '', url: '' };
+              }
+            };
 
             const formatComments = (comments) => {
               const sorted = [...comments].sort(
@@ -894,10 +923,6 @@ jobs:
 
               const formatted = selected.map((comment, index) => {
                 const authorLogin = comment.user?.login || "";
-                const previousCommentBody =
-                  index > 0
-                    ? stripCodexHiddenBlocks(selected[index - 1]?.body || "")
-                    : "";
                 const author = authorLogin;
                 const cleanedBody = stripCodexHiddenBlocks(comment.body || "");
                 const body = newestCommentIds.has(comment.id)
@@ -915,17 +940,42 @@ jobs:
               return `${label} #${number}${urlSuffix}`;
             };
 
-            const formatThreadCommentsSection = (threadContext, comments) => {
-              const heading =
-                threadContext.type === 'pull_request'
-                  ? "PR's latest comments"
-                  : "Issue's latest comments";
-              const contextLabel = formatContextLabel(threadContext);
-              const formattedComments = formatComments(comments);
-              if (!formattedComments) {
-                return `${heading}: ${contextLabel}\n(no comments)`;
+            const formatContextHeading = (role, type) => {
+              const isAssociated = role === 'associated';
+              if (isAssociated) {
+                return type === 'pull_request' ? 'Associated PR' : 'Associated Issue';
               }
-              return `${heading}: ${contextLabel}\n${formattedComments}`;
+              return type === 'pull_request' ? 'Triggering PR' : 'Triggering Issue';
+            };
+
+            const formatThreadContextSection = (
+              role,
+              threadContext,
+              threadDetails,
+              comments
+            ) => {
+              const heading = formatContextHeading(role, threadContext.type);
+              const url = (threadContext.url || threadDetails.url || '').trim();
+              const contextLabel = formatContextLabel({
+                ...threadContext,
+                url,
+              });
+
+              const title = stripCodexHiddenBlocks(threadDetails.title || '').trim();
+              const rawBody = stripCodexHiddenBlocks(threadDetails.body || '').trim();
+              const description = rawBody
+                ? truncateDescription(rawBody, DESCRIPTION_CHAR_LIMIT)
+                : '(no description)';
+
+              const formattedComments = formatComments(comments);
+              const latestComments = formattedComments ? formattedComments : '(no comments)';
+
+              return [
+                `${heading}: ${contextLabel}`,
+                `Title: ${title || '(no title)'}`,
+                `Description:\n${description}`,
+                `Latest comments:\n${latestComments}`,
+              ].join('\n\n');
             };
 
             let linkedContext = null;
@@ -979,45 +1029,34 @@ jobs:
               linkedContext.number &&
               linkedContext.number !== primaryContext.number
             ) {
-              const linkedComments = await fetchIssueComments(
-                linkedContext.number
-              );
+              const [linkedDetails, linkedComments] = await Promise.all([
+                fetchThreadDetails(linkedContext.number),
+                fetchIssueComments(linkedContext.number),
+              ]);
               sections.push(
-                formatThreadCommentsSection(linkedContext, linkedComments)
+                formatThreadContextSection(
+                  'associated',
+                  linkedContext,
+                  linkedDetails,
+                  linkedComments
+                )
               );
             }
 
-            const primaryComments = await fetchIssueComments(primaryContext.number);
-            sections.push(formatThreadCommentsSection(primaryContext, primaryComments));
+            const [primaryDetails, primaryComments] = await Promise.all([
+              fetchThreadDetails(primaryContext.number),
+              fetchIssueComments(primaryContext.number),
+            ]);
+            sections.push(
+              formatThreadContextSection(
+                'triggering',
+                primaryContext,
+                primaryDetails,
+                primaryComments
+              )
+            );
 
             core.setOutput('comments_text', sections.join("\n\n---\n\n"));
-
-      - name: Fetch issue/PR details
-        id: details
-        uses: actions/github-script@v7
-        with:
-          script: |
-            let issueNumber = null;
-            if (context.eventName === 'issue_comment' || context.eventName === 'issues') {
-              issueNumber = context.payload.issue.number;
-            } else {
-              issueNumber = context.payload.pull_request.number;
-            }
-
-            if (!issueNumber) {
-              core.setOutput('issue_title', '');
-              core.setOutput('issue_body', '');
-              return;
-            }
-
-            const issue = await github.rest.issues.get({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: issueNumber
-            });
-
-            core.setOutput('issue_title', issue.data.title || '');
-            core.setOutput('issue_body', issue.data.body || '');
 
       - name: Log trigger resolution
         env:
@@ -1089,8 +1128,6 @@ jobs:
           ACTIVE_PR_NUMBER: ${{ steps.branch.outputs.active_pr_number }}
           ACTIVE_PR_URL: ${{ steps.branch.outputs.active_pr_url }}
           COMMENTS_TEXT: ${{ steps.comments.outputs.comments_text }}
-          ISSUE_TITLE: ${{ steps.details.outputs.issue_title }}
-          ISSUE_BODY: ${{ steps.details.outputs.issue_body }}
           CODEX_GH_TOKEN: ${{ secrets.CODEX_GH_TOKEN }}
         run: |
           python3 - <<'PY'
@@ -1107,9 +1144,7 @@ jobs:
           active_pr_number = os.environ.get("ACTIVE_PR_NUMBER", "").strip()
           active_pr_url = os.environ.get("ACTIVE_PR_URL", "").strip()
           workspace = os.environ.get("GITHUB_WORKSPACE", "")
-          issue_title_from_api = os.environ.get("ISSUE_TITLE", "").strip()
           github_token = os.environ.get("CODEX_GH_TOKEN", "").strip()
-          issue_body_from_api = os.environ.get("ISSUE_BODY", "").strip()
 
           with open(event_path, "r", encoding="utf-8") as handle:
             event = json.load(handle)
@@ -1144,14 +1179,7 @@ jobs:
             issue_url = issue.get("html_url", "")
             issue_number = issue.get("number", "")
 
-          if issue_title_from_api:
-            issue_title = issue_title_from_api
-
-          issue_number_display = issue_number or "<number>"
           comments_text = os.environ.get("COMMENTS_TEXT", "").strip()
-          issue_body_text = issue_body_from_api or ""
-          if issue_body_text and len(issue_body_text) > 12000:
-            issue_body_text = issue_body_text[:12000] + "\n\n…(truncated)…"
 
           if active_pr_number and active_pr_url:
             active_pr_display = f"#{active_pr_number} ({active_pr_url})"
@@ -1244,10 +1272,6 @@ jobs:
             Active PR: {active_pr_display}
             Workspace: {workspace}
             URL: {context_url}
-            Title: {issue_title}
-
-            Description:
-            {issue_body_text}
 
             {comments_text}
             """).strip()

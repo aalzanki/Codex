@@ -13,21 +13,23 @@ test("codex-shared prompt ends with trigger thread comments", () => {
   );
   const workflow = fs.readFileSync(workflowPath, "utf8");
 
-  const linkedNeedle = "formatThreadCommentsSection(linkedContext, linkedComments)";
+  const linkedNeedle =
+    /sections\.push\(\s*formatThreadContextSection\(\s*'associated'/;
   const primaryNeedle =
-    "formatThreadCommentsSection(primaryContext, primaryComments)";
+    /sections\.push\(\s*formatThreadContextSection\(\s*'triggering'/;
 
-  assert.ok(
-    workflow.includes(linkedNeedle),
-    "Expected workflow to format linked context comment sections."
+  assert.match(
+    workflow,
+    linkedNeedle,
+    "Expected workflow to format associated context sections."
+  );
+  assert.match(
+    workflow,
+    primaryNeedle,
+    "Expected workflow to format triggering context sections."
   );
   assert.ok(
-    workflow.includes(primaryNeedle),
-    "Expected workflow to format thread context comment sections."
-  );
-  assert.ok(
-    workflow.indexOf(linkedNeedle) < workflow.indexOf(primaryNeedle),
+    workflow.search(linkedNeedle) < workflow.search(primaryNeedle),
     "Expected codex prompt to list linked context comments before the triggering thread so the prompt ends with the trigger thread."
   );
 });
-
