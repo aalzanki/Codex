@@ -31,12 +31,34 @@ test("codex-shared checkout uses ephemeral extraheader git auth", () => {
   const workflow = fs.readFileSync(workflowPath, "utf8");
 
   assert.ok(
-    workflow.includes("GIT_CONFIG_KEY_0=\"http.https://github.com/.extraheader\""),
-    "Expected workflow to export an ephemeral http extraheader for git auth."
+    workflow.includes("GITHUB_WORKFLOW_REF"),
+    "Expected codex-shared workflow to derive the shared checkout script location from GITHUB_WORKFLOW_REF."
   );
   assert.ok(
-    workflow.includes("git remote set-url origin \"$repo_no_auth\""),
-    "Expected workflow to keep origin as a non-auth URL."
+    workflow.includes(".github/scripts/self-hosted-checkout.sh"),
+    "Expected codex-shared workflow to fetch the shared self-hosted-checkout script."
   );
 });
 
+test("self-hosted-checkout uses per-command extraheader auth and keeps origin non-auth", () => {
+  const scriptPath = path.join(__dirname, "..", "self-hosted-checkout.sh");
+  const script = fs.readFileSync(scriptPath, "utf8");
+
+  assert.ok(
+    script.includes("http.https://github.com/.extraheader"),
+    "Expected checkout script to inject an ephemeral http extraheader for git auth."
+  );
+  assert.equal(
+    script.includes("https://x-access-token:"),
+    false,
+    "Checkout script should not embed tokens in https origin URLs."
+  );
+  assert.ok(
+    script.includes('git remote set-url origin "$repo_no_auth"'),
+    "Expected checkout script to keep origin as a non-auth URL."
+  );
+  assert.ok(
+    script.includes("cleaning workspace for recovery"),
+    "Expected checkout script to clean workspace if it's non-empty but missing .git."
+  );
+});

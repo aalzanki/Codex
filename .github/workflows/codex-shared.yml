@@ -300,116 +300,38 @@ jobs:
           app-id: ${{ secrets.CODEX_GITHUB_APP_ID }}
           private-key: ${{ secrets.CODEX_GITHUB_APP_PRIVATE_KEY }}
 
-      - name: Checkout target branch
+      - name: Checkout target branch (self-hosted)
         shell: bash
+        env:
+          BRANCH: ${{ steps.branch.outputs.branch }}
+          TOKEN: ${{ steps.app-token.outputs.token }}
+          TOKEN_LABEL: GitHub App token
         run: |
           set -euo pipefail
 
-          workspace="${GITHUB_WORKSPACE}"
-          branch="${{ steps.branch.outputs.branch }}"
-          token="${{ steps.app-token.outputs.token }}"
-          repo_slug="${GITHUB_REPOSITORY}"
-          repo_no_auth="https://github.com/${repo_slug}.git"
-
-          if [ -z "$branch" ]; then
-            echo "::error::Target branch is empty."
+          # The shared checkout implementation lives in the workflow repository (this repo).
+          # Fetch it by parsing the workflow ref so we don't hardcode a specific owner/repo.
+          workflow_ref="${GITHUB_WORKFLOW_REF:-}"
+          workflow_sha="${GITHUB_WORKFLOW_SHA:-}"
+          if [ -z "$workflow_ref" ]; then
+            echo "::error::GITHUB_WORKFLOW_REF is empty; cannot locate shared checkout script."
             exit 1
           fi
 
-          if [ -z "$token" ]; then
-            echo "::error::GitHub App token is empty. Check CODEX_GITHUB_APP_ID / CODEX_GITHUB_APP_PRIVATE_KEY secrets."
-            exit 1
-          fi
+          workflow_repo_path="${workflow_ref%@*}"
+          workflow_repo="$(printf '%s' "$workflow_repo_path" | cut -d/ -f1-2)"
+          ref="${workflow_sha:-${workflow_ref#*@}}"
+          case "$ref" in
+            refs/heads/*) ref="${ref#refs/heads/}" ;;
+            refs/tags/*) ref="${ref#refs/tags/}" ;;
+          esac
 
-          # Authenticate git without persisting tokens in the workspace.
-          # - Keep `origin` as a non-auth URL.
-          # - Provide auth via an ephemeral `http.https://github.com/.extraheader` injected with env vars.
-          token_b64="$(printf 'x-access-token:%s' "$token" | base64 | tr -d '\n')"
-          extraheader="AUTHORIZATION: basic ${token_b64}"
-          export GIT_CONFIG_COUNT=1
-          export GIT_CONFIG_KEY_0="http.https://github.com/.extraheader"
-          export GIT_CONFIG_VALUE_0="$extraheader"
-          {
-            echo "GIT_CONFIG_COUNT=$GIT_CONFIG_COUNT"
-            echo "GIT_CONFIG_KEY_0=$GIT_CONFIG_KEY_0"
-            echo "GIT_CONFIG_VALUE_0=$GIT_CONFIG_VALUE_0"
-          } >> "$GITHUB_ENV"
+          checkout_script="${RUNNER_TEMP}/self-hosted-checkout.sh"
+          script_url="https://raw.githubusercontent.com/${workflow_repo}/${ref}/.github/scripts/self-hosted-checkout.sh"
+          curl -fsSL "$script_url" -o "$checkout_script"
+          chmod +x "$checkout_script"
 
-          echo "Checking out ${repo_no_auth} @ ${branch}"
-
-          if command -v curl >/dev/null 2>&1; then
-            api_url="https://api.github.com/repos/${repo_slug}"
-            http_code="$(curl -sS -o /dev/null -w "%{http_code}" -H "Authorization: Bearer ${token}" -H "X-GitHub-Api-Version: 2022-11-28" "${api_url}" || true)"
-            if [ -z "${http_code}" ] || [ "${http_code}" = "000" ]; then
-              echo "::warning::Unable to verify GitHub API access (HTTP ${http_code}); proceeding with git checkout."
-            elif [ "${http_code}" = "401" ] || [ "${http_code}" = "404" ]; then
-              echo "::error::GitHub App token cannot access ${api_url} (HTTP ${http_code}). Ensure the GitHub App is installed on this repo and has 'Contents' permission."
-              exit 1
-            elif [ "${http_code}" != "200" ]; then
-              echo "::warning::GitHub API returned HTTP ${http_code} for ${api_url}; proceeding with git checkout."
-            fi
-          fi
-
-          if [ -d "$workspace" ] && [ -n "$(ls -A "$workspace")" ] && [ ! -d "$workspace/.git" ]; then
-            echo "::error::Workspace is non-empty but not a git repo."
-            echo "::error::Refusing to continue to avoid partial state."
-            echo "Contents of $workspace:"
-            ls -la "$workspace"
-            exit 1
-          fi
-
-          mkdir -p "$workspace"
-
-          if [ ! -d "$workspace/.git" ]; then
-            echo "Workspace missing .git; cloning $repo_no_auth into $workspace"
-            git clone "$repo_no_auth" "$workspace"
-          fi
-
-          git config --global --add safe.directory "$workspace"
-
-          cd "$workspace"
-          if git config --local --get-all http.https://github.com/.extraheader >/dev/null 2>&1; then
-            echo "Clearing persisted GitHub auth headers from local repo config"
-            git config --local --unset-all http.https://github.com/.extraheader || true
-          fi
-          if git remote get-url origin >/dev/null 2>&1; then
-            origin_url="$(git remote get-url origin || true)"
-            if printf '%s' "$origin_url" | grep -q 'x-access-token:'; then
-              echo "Detected tokenized origin URL from a previous run; resetting to non-auth URL."
-            fi
-            git remote set-url origin "$repo_no_auth"
-          else
-            echo "Remote 'origin' missing; adding it."
-            git remote add origin "$repo_no_auth"
-          fi
-          # Self-hosted runners can reuse the same workspace between jobs.
-          # Clean first so branch checkout can't fail with "local changes would be overwritten".
-          git reset --hard HEAD
-          git clean -df
-          set +e
-          fetch_status=0
-          for attempt in 1 2 3; do
-            git fetch --prune origin
-            fetch_status=$?
-            if [ $fetch_status -eq 0 ]; then
-              break
-            fi
-            echo "git fetch failed (attempt ${attempt}/3, exit ${fetch_status}); retrying..."
-            sleep $((attempt * 2))
-          done
-          set -e
-          if [ $fetch_status -ne 0 ]; then
-            echo "::error::git fetch failed for ${repo_no_auth} (exit ${fetch_status}). If the log shows 'Repository not found', the token likely lacks access."
-            exit $fetch_status
-          fi
-
-          if ! git show-ref --verify --quiet "refs/remotes/origin/$branch"; then
-            echo "::error::Remote branch origin/$branch not found in ${repo_no_auth}"
-            exit 1
-          fi
-          git checkout -f -B "$branch" "origin/$branch"
-          git reset --hard "origin/$branch"
-          git clean -df
+          bash "$checkout_script"
 
       - name: Configure git identity
         shell: bash
