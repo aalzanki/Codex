@@ -331,6 +331,8 @@ jobs:
 
       - name: Generate GitHub App token
         id: app-token
+        # Needed for GitHub API calls in later steps (issue/PR comments, etc.).
+        # Checkout itself is SSH-based on self-hosted runners.
         uses: actions/create-github-app-token@v1
         with:
           app-id: ${{ secrets.CODEX_GITHUB_APP_ID }}
@@ -340,10 +342,13 @@ jobs:
         shell: bash
         env:
           BRANCH: ${{ steps.branch.outputs.branch }}
-          TOKEN: ${{ steps.app-token.outputs.token }}
-          TOKEN_LABEL: GitHub App token
         run: |
           set -euo pipefail
+
+          # Runner contract:
+          # - git auth must use SSH (`gh auth login --git-protocol ssh` + loaded SSH key)
+          # - checkout script forces origin to `git@github.com:<owner>/<repo>.git`
+          # - do not convert this flow back to HTTPS/token-based git remotes
 
           # The shared checkout implementation lives in the reusable workflow repository (this repo).
           #

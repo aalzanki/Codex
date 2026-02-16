@@ -4,12 +4,11 @@ set -euo pipefail
 workspace="${GITHUB_WORKSPACE}"
 branch="${BRANCH:-}"
 ref_sha="${REF_SHA:-}"
-token="${TOKEN:-}"
-token_label="${TOKEN_LABEL:-GitHub token}"
 ensure_file_path="${ENSURE_FILE_PATH:-}"
 repo_slug="${GITHUB_REPOSITORY}"
-repo_no_auth="https://github.com/${repo_slug}.git"
-auth_extraheader=""
+# Self-hosted runners are expected to authenticate GitHub git operations over SSH.
+# Keep origin as SSH so later fetch/push operations in this job never depend on HTTPS auth headers.
+repo_ssh="git@github.com:${repo_slug}.git"
 
 cleanup_typescript_cache() {
   local ts_build_info="${workspace}/tsconfig.tsbuildinfo"
@@ -28,18 +27,6 @@ if [ -z "$branch" ]; then
   exit 1
 fi
 
-if [ -z "$token" ]; then
-  echo "::error::${token_label} is empty."
-  exit 1
-fi
-
-auth_basic="$(printf 'x-access-token:%s' "$token" | base64 | tr -d '\r\n')"
-auth_extraheader="AUTHORIZATION: basic ${auth_basic}"
-
-run_git_with_auth() {
-  git -c "http.https://github.com/.extraheader=${auth_extraheader}" "$@"
-}
-
 run_git_without_lfs_smudge() {
   git \
     -c filter.lfs.process= \
@@ -48,15 +35,7 @@ run_git_without_lfs_smudge() {
     "$@"
 }
 
-run_git_with_auth_without_lfs_smudge() {
-  run_git_with_auth \
-    -c filter.lfs.process= \
-    -c filter.lfs.smudge= \
-    -c filter.lfs.required=false \
-    "$@"
-}
-
-echo "Checking out ${repo_no_auth} @ ${branch} (${ref_sha})"
+echo "Checking out ${repo_ssh} @ ${branch} (${ref_sha})"
 
 workspace_is_non_empty=false
 if [ -d "$workspace" ] && [ -n "$(ls -A "$workspace")" ]; then
@@ -79,21 +58,22 @@ fi
 mkdir -p "$workspace"
 
 if ! is_valid_git_workspace; then
-  echo "Workspace is not a valid git worktree; cloning ${repo_no_auth} into ${workspace}"
-  run_git_with_auth clone "$repo_no_auth" "$workspace"
+  echo "Workspace is not a valid git worktree; cloning ${repo_ssh} into ${workspace}"
+  git clone "$repo_ssh" "$workspace"
 fi
 
 git config --global --add safe.directory "$workspace"
 
 cd "$workspace"
+# Migration cleanup: older revisions used HTTPS + per-command extraheader auth.
 if git config --local --get-all http.https://github.com/.extraheader >/dev/null 2>&1; then
-  echo "Clearing persisted GitHub auth headers from local repo config"
+  echo "Clearing legacy GitHub HTTPS auth headers from local repo config"
   git config --local --unset-all http.https://github.com/.extraheader || true
 fi
 if git remote get-url origin >/dev/null 2>&1; then
-  git remote set-url origin "$repo_no_auth"
+  git remote set-url origin "$repo_ssh"
 else
-  git remote add origin "$repo_no_auth"
+  git remote add origin "$repo_ssh"
 fi
 
 # Keep ignored directories (for example node_modules) for faster self-hosted runs.
@@ -108,7 +88,7 @@ cleanup_typescript_cache
 set +e
 fetch_status=0
 for attempt in 1 2 3; do
-  run_git_with_auth fetch --prune origin
+  git fetch --prune origin
   fetch_status=$?
   if [ $fetch_status -eq 0 ]; then
     break
@@ -118,20 +98,20 @@ for attempt in 1 2 3; do
 done
 set -e
 if [ $fetch_status -ne 0 ]; then
-  echo "::error::git fetch failed for ${repo_no_auth} (exit ${fetch_status}). If the log shows 'Repository not found', the token likely lacks access."
+  echo "::error::git fetch failed for ${repo_ssh} (exit ${fetch_status}). Ensure the runner has GitHub SSH access and a trusted github.com host key."
   exit $fetch_status
 fi
 
 if ! git show-ref --verify --quiet "refs/remotes/origin/$branch"; then
-  echo "::error::Remote branch origin/$branch not found in ${repo_no_auth}"
+  echo "::error::Remote branch origin/$branch not found in ${repo_ssh}"
   exit 1
 fi
 
-run_git_with_auth_without_lfs_smudge checkout -f -B "$branch" "origin/$branch"
+run_git_without_lfs_smudge checkout -f -B "$branch" "origin/$branch"
 if [ -n "$ref_sha" ]; then
-  run_git_with_auth_without_lfs_smudge reset --hard "$ref_sha"
+  run_git_without_lfs_smudge reset --hard "$ref_sha"
 else
-  run_git_with_auth_without_lfs_smudge reset --hard "origin/$branch"
+  run_git_without_lfs_smudge reset --hard "origin/$branch"
 fi
 git clean -df
 cleanup_typescript_cache
@@ -140,7 +120,7 @@ if git lfs version >/dev/null 2>&1; then
   set +e
   lfs_pull_status=0
   for attempt in 1 2 3; do
-    run_git_with_auth lfs pull
+    git lfs pull
     lfs_pull_status=$?
     if [ $lfs_pull_status -eq 0 ]; then
       break
@@ -150,7 +130,7 @@ if git lfs version >/dev/null 2>&1; then
   done
   set -e
   if [ $lfs_pull_status -ne 0 ]; then
-    echo "::error::git lfs pull failed for ${repo_no_auth} (exit ${lfs_pull_status}). Ensure ${token_label} can read repository LFS objects."
+    echo "::error::git lfs pull failed for ${repo_ssh} (exit ${lfs_pull_status}). Ensure the runner SSH identity can read repository LFS objects."
     echo "::error::Inspect runner diagnostics with: git lfs logs last"
     exit $lfs_pull_status
   fi

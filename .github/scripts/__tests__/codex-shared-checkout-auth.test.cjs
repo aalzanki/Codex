@@ -20,7 +20,7 @@ test("codex-shared checkout does not persist tokenized origin URLs", () => {
   );
 });
 
-test("codex-shared checkout uses ephemeral extraheader git auth", () => {
+test("codex-shared checkout resolves the shared script source via OIDC workflow claims", () => {
   const workflowPath = path.join(
     __dirname,
     "..",
@@ -44,22 +44,36 @@ test("codex-shared checkout uses ephemeral extraheader git auth", () => {
   );
 });
 
-test("self-hosted-checkout uses per-command extraheader auth and keeps origin non-auth", () => {
+test("self-hosted-checkout keeps origin on SSH and does not use tokenized HTTPS git auth", () => {
   const scriptPath = path.join(__dirname, "..", "self-hosted-checkout.sh");
   const script = fs.readFileSync(scriptPath, "utf8");
 
   assert.ok(
-    script.includes("http.https://github.com/.extraheader"),
-    "Expected checkout script to inject an ephemeral http extraheader for git auth."
+    script.includes('repo_ssh="git@github.com:${repo_slug}.git"'),
+    "Expected checkout script to define SSH origin URLs for GitHub."
   );
   assert.equal(
     script.includes("https://x-access-token:"),
     false,
-    "Checkout script should not embed tokens in https origin URLs."
+    "Checkout script should not embed tokens in HTTPS origin URLs."
+  );
+  assert.equal(
+    script.includes("AUTHORIZATION: basic"),
+    false,
+    "Checkout script should not build basic-auth headers for git operations."
+  );
+  assert.equal(
+    script.includes("run_git_with_auth"),
+    false,
+    "Checkout script should not use helper wrappers that inject HTTP auth headers."
   );
   assert.ok(
-    script.includes('git remote set-url origin "$repo_no_auth"'),
-    "Expected checkout script to keep origin as a non-auth URL."
+    script.includes('git remote set-url origin "$repo_ssh"'),
+    "Expected checkout script to keep origin configured as SSH."
+  );
+  assert.ok(
+    script.includes("Clearing legacy GitHub HTTPS auth headers"),
+    "Expected checkout script to clean up legacy HTTPS auth headers from older runs."
   );
   assert.ok(
     script.includes("cleaning workspace for recovery"),
@@ -83,8 +97,8 @@ test("self-hosted-checkout uses per-command extraheader auth and keeps origin no
     "Checkout script should avoid env-var toggles for LFS smudge behavior."
   );
   assert.ok(
-    script.includes("run_git_with_auth lfs pull"),
-    "Expected checkout script to perform an authenticated git lfs pull after checkout."
+    script.includes("git lfs pull"),
+    "Expected checkout script to perform git lfs pull after checkout."
   );
 });
 
