@@ -22,27 +22,17 @@ jobs:
         github.event.comment.body == '@codex' ||
         startsWith(github.event.comment.body, '@codex ') ||
         startsWith(github.event.comment.body, format('@codex{0}', fromJSON('"\n"'))) ||
-        startsWith(github.event.comment.body, format('@codex{0}', fromJSON('"\r\n"'))) ||
-        github.event.comment.body == '@codex-canary' ||
-        startsWith(github.event.comment.body, '@codex-canary ') ||
-        startsWith(github.event.comment.body, format('@codex-canary{0}', fromJSON('"\n"'))) ||
-        startsWith(github.event.comment.body, format('@codex-canary{0}', fromJSON('"\r\n"')))
+        startsWith(github.event.comment.body, format('@codex{0}', fromJSON('"\r\n"')))
       )) ||
       (github.event_name == 'issues' && (
         (github.event.issue.body || '') == '@codex' ||
         startsWith(github.event.issue.body || '', '@codex ') ||
         startsWith(github.event.issue.body || '', format('@codex{0}', fromJSON('"\n"'))) ||
         startsWith(github.event.issue.body || '', format('@codex{0}', fromJSON('"\r\n"'))) ||
-        (github.event.issue.body || '') == '@codex-canary' ||
-        startsWith(github.event.issue.body || '', '@codex-canary ') ||
-        startsWith(github.event.issue.body || '', format('@codex-canary{0}', fromJSON('"\n"'))) ||
-        startsWith(github.event.issue.body || '', format('@codex-canary{0}', fromJSON('"\r\n"'))) ||
         (github.event.issue.title || '') == '@codex' ||
-        startsWith(github.event.issue.title || '', '@codex ') ||
-        (github.event.issue.title || '') == '@codex-canary' ||
-        startsWith(github.event.issue.title || '', '@codex-canary ')
+        startsWith(github.event.issue.title || '', '@codex ')
       ))
-    uses: aalzanki/Codex-Shared/.github/workflows/codex-shared.yml@main
+    uses: aalzanki/codex-shared/.github/workflows/codex-shared.yml@main
     permissions:
       actions: write
       checks: write
@@ -72,7 +62,7 @@ Then:
 1. Create a GitHub App and install it on the target repo (details below).
 1. Add the required secrets to the target repo (or org-level secrets).
 1. Make sure you have self-hosted runners in the runner group you set in `runner_group`.
-1. Trigger a run by commenting `@codex` (or `@codex-canary`) on an issue/PR, or by opening an issue whose title/body starts with the trigger phrase.
+1. Trigger a run by commenting `@codex` on an issue/PR, or by opening an issue whose title/body starts with the trigger phrase.
 
 ## GitHub App Setup (Required)
 
