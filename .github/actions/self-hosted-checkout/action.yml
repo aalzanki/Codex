@@ -1,0 +1,40 @@
+name: Self-hosted checkout
+description: Checkout a branch/commit in a persistent self-hosted workspace without removing ignored files
+
+inputs:
+    branch:
+        description: Branch to checkout from origin
+        required: true
+    token:
+        description: Token used to authenticate git operations
+        required: true
+    ref_sha:
+        description: Optional commit SHA to hard reset to after checkout
+        required: false
+        default: ''
+    token_label:
+        description: Label used in token-empty error messages
+        required: false
+        default: GitHub token
+
+runs:
+    using: composite
+    steps:
+        - name: Checkout branch in persistent workspace
+          shell: bash
+          env:
+              BRANCH: ${{ inputs.branch }}
+              REF_SHA: ${{ inputs.ref_sha }}
+              TOKEN: ${{ inputs.token }}
+              TOKEN_LABEL: ${{ inputs.token_label }}
+          run: |
+              set -euo pipefail
+
+              checkout_script="${GITHUB_ACTION_PATH}/../../scripts/self-hosted-checkout.sh"
+              if [ ! -f "$checkout_script" ]; then
+                echo "::error::Checkout script is missing: ${checkout_script}"
+                exit 1
+              fi
+
+              bash "$checkout_script"
+
