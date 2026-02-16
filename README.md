@@ -1,6 +1,6 @@
 # Codex Shared
 
-This repo provides a reusable GitHub Actions workflow you can call from other repos to run Codex when someone mentions `@codex` on an issue or pull request.
+This repo provides a reusable self-hosted GitHub Actions workflow you can call from other repos to run Codex when someone mentions `@codex` on an issue or pull request.
 
 ## Quickstart
 
