@@ -64,7 +64,7 @@ jobs:
     with:
       trigger_phrase: '@codex'
       runner_group: 'YOUR_RUNNER_GROUP_NAME'
-      model: 'gpt-5.2'
+      model: 'gpt-5.3-codex'
 ```
 
 Then:
