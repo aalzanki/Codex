@@ -53,12 +53,16 @@ test("codex-shared workflow posts Discord notifications only with mapped webhook
     "Expected a step that posts Discord completion notifications."
   );
   assert.ok(
-    workflow.includes("steps.discord_webhook.outputs.webhook_url != ''"),
-    "Expected Discord post step to require a resolved mapped webhook URL."
+    workflow.includes("steps.discord_webhook.outputs.notify_discord == 'true'"),
+    "Expected Discord post step to run only when webhook resolution explicitly enables notification."
   );
   assert.ok(
     workflow.includes("steps.post_response.outputs.comment_url != ''"),
     "Expected Discord post step to require the exact final GitHub comment URL."
+  );
+  assert.ok(
+    workflow.includes("steps.post_response.outputs.discord_preview != ''"),
+    "Expected Discord post step to require a non-empty Codex preview payload."
   );
   assert.ok(
     workflow.includes("output.write(f\"trigger_login={trigger_login}\\n\")"),
@@ -69,11 +73,35 @@ test("codex-shared workflow posts Discord notifications only with mapped webhook
     "Expected workflow to expose the final GitHub comment URL for notifications."
   );
   assert.ok(
+    workflow.includes("core.setOutput('discord_preview', '');"),
+    "Expected workflow to initialize discord_preview output to empty."
+  );
+  assert.ok(
+    workflow.includes("const toDiscordPreview = (text, maxChars = 140) => {"),
+    "Expected workflow to cap Discord preview text to 140 characters."
+  );
+  assert.ok(
+    workflow.includes("core.setOutput('notify_discord', 'false');"),
+    "Expected workflow to default Discord notification to disabled when no mapped webhook is found."
+  );
+  assert.ok(
+    workflow.includes("core.setOutput('notify_discord', 'true');"),
+    "Expected workflow to enable Discord notification only after successful webhook resolution."
+  );
+  assert.ok(
     workflow.includes("curl --fail --silent --show-error"),
     "Expected Discord notification delivery to use curl transport."
   );
   assert.ok(
     workflow.includes("--retry 3"),
     "Expected Discord notification delivery to retry transient transport failures."
+  );
+  assert.ok(
+    workflow.includes("DISCORD_PREVIEW: ${{ steps.post_response.outputs.discord_preview }}"),
+    "Expected Discord post step to read preview content from post_response output."
+  );
+  assert.ok(
+    workflow.includes("print(json.dumps({\"content\": f\"{preview}\\n{comment_url}\"}, ensure_ascii=False))"),
+    "Expected Discord payload to contain only preview text followed by the comment URL."
   );
 });

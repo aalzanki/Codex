@@ -1732,6 +1732,7 @@ jobs:
               jobUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
             }
             core.setOutput('job_url', jobUrl);
+            core.setOutput('discord_preview', '');
 
             const formatDuration = (totalSeconds) => {
               if (!Number.isFinite(totalSeconds) || totalSeconds < 0) {
@@ -1889,11 +1890,31 @@ jobs:
                 .replace(/<!--\s*CODEX_DESCRIPTION_START[\s\S]*?CODEX_DESCRIPTION_END\s*-->\s*/g, '')
                 .trim();
             };
+            const normalizeWhitespace = (text) =>
+              String(text || '')
+                .replace(/\s+/g, ' ')
+                .trim();
+            const toDiscordPreview = (text, maxChars = 140) => {
+              const normalized = normalizeWhitespace(text);
+              if (!normalized) {
+                return '';
+              }
+              const limit = Math.max(4, Number(maxChars) || 140);
+              const bodyLimit = limit - 3;
+              if (normalized.length > bodyLimit) {
+                return `${normalized.slice(0, bodyLimit).trimEnd()}...`;
+              }
+              return `${normalized}...`;
+            };
 
             const visibleOutput = stripCodexHiddenBlocks(output);
             const body = visibleOutput
               ? `[run](${jobUrl})\n\n${visibleOutput}`
               : `[run](${jobUrl})\n\n(No public output from ${assistantName}.)`;
+            const discordPreview = toDiscordPreview(visibleOutput, 140);
+            if (discordPreview) {
+              core.setOutput('discord_preview', discordPreview);
+            }
 
             setCommentUrlOutput();
             await updateCommentWithRetry({
@@ -1979,6 +2000,8 @@ jobs:
 
             const triggerLogin = normalizeLogin(process.env.TRIGGER_LOGIN || '');
             core.setOutput('trigger_login', triggerLogin);
+            core.setOutput('webhook_url', '');
+            core.setOutput('notify_discord', 'false');
             if (!triggerLogin) {
               core.info('Trigger login missing; Discord notification disabled.');
               return;
@@ -2013,20 +2036,16 @@ jobs:
 
             core.setSecret(webhookUrl);
             core.setOutput('webhook_url', webhookUrl);
+            core.setOutput('notify_discord', 'true');
             core.info(`Discord webhook resolved for @${triggerLogin}.`);
 
       - name: Post Discord completion notification
-        if: ${{ always() && steps.discord_webhook.outputs.webhook_url != '' && steps.post_response.outputs.comment_url != '' }}
+        if: ${{ always() && steps.discord_webhook.outputs.notify_discord == 'true' && steps.post_response.outputs.comment_url != '' && steps.post_response.outputs.discord_preview != '' }}
         shell: bash
         env:
           DISCORD_WEBHOOK_URL: ${{ steps.discord_webhook.outputs.webhook_url }}
-          TRIGGER_LOGIN: ${{ steps.discord_webhook.outputs.trigger_login }}
+          DISCORD_PREVIEW: ${{ steps.post_response.outputs.discord_preview }}
           COMMENT_URL: ${{ steps.post_response.outputs.comment_url }}
-          JOB_URL: ${{ steps.post_response.outputs.job_url }}
-          ASSISTANT_NAME: ${{ steps.prompt.outputs.assistant_name }}
-          CODEX_STEP_OUTCOME: ${{ steps.codex.outcome }}
-          JOB_STATUS: ${{ job.status }}
-          REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
 
@@ -2040,32 +2059,12 @@ jobs:
           if not webhook_url:
             raise SystemExit(0)
 
-          assistant_name = (os.environ.get("ASSISTANT_NAME", "") or "Codex").strip()
-          trigger_login = (os.environ.get("TRIGGER_LOGIN", "") or "").strip()
-          repository = (os.environ.get("REPOSITORY", "") or "").strip()
+          preview = (os.environ.get("DISCORD_PREVIEW", "") or "").strip()
           comment_url = (os.environ.get("COMMENT_URL", "") or "").strip()
-          job_url = (os.environ.get("JOB_URL", "") or "").strip()
-          codex_outcome = (os.environ.get("CODEX_STEP_OUTCOME", "") or "").strip().lower()
-          job_status = (os.environ.get("JOB_STATUS", "") or "").strip().lower()
+          if not preview or not comment_url:
+            raise SystemExit(0)
 
-          if job_status == "cancelled":
-            status = "canceled"
-          elif codex_outcome == "success":
-            status = "completed successfully"
-          else:
-            status = "failed"
-
-          actor = f"@{trigger_login}" if trigger_login else "the trigger user"
-          lines = [
-            f"{assistant_name} run {status}.",
-            f"Repo: {repository}",
-            f"Requested by: {actor}",
-            f"Comment: {comment_url}",
-          ]
-          if job_url:
-            lines.append(f"Run: {job_url}")
-
-          print(json.dumps({"content": "\n".join(lines)}, ensure_ascii=False))
+          print(json.dumps({"content": f"{preview}\n{comment_url}"}, ensure_ascii=False))
           PY
 
           curl --fail --silent --show-error \
