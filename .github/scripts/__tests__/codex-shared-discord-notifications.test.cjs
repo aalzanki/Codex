@@ -68,4 +68,12 @@ test("codex-shared workflow posts Discord notifications only with mapped webhook
     workflow.includes("core.setOutput('comment_url', commentUrl);"),
     "Expected workflow to expose the final GitHub comment URL for notifications."
   );
+  assert.ok(
+    workflow.includes("curl --fail --silent --show-error"),
+    "Expected Discord notification delivery to use curl transport."
+  );
+  assert.ok(
+    workflow.includes("--retry 3"),
+    "Expected Discord notification delivery to retry transient transport failures."
+  );
 });

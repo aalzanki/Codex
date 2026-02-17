@@ -2030,11 +2030,11 @@ jobs:
         run: |
           set -euo pipefail
 
-          python3 - <<'PY'
+          payload_file="${RUNNER_TEMP}/discord-webhook-payload.json"
+
+          python3 - <<'PY' > "$payload_file"
           import json
           import os
-          import urllib.error
-          import urllib.request
 
           webhook_url = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
           if not webhook_url:
@@ -2065,21 +2065,12 @@ jobs:
           if job_url:
             lines.append(f"Run: {job_url}")
 
-          payload = json.dumps({"content": "\n".join(lines)}, ensure_ascii=False).encode("utf-8")
-          request = urllib.request.Request(
-            webhook_url,
-            data=payload,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-          )
-          try:
-            with urllib.request.urlopen(request, timeout=20) as response:
-              status_code = getattr(response, "status", response.getcode())
-              if int(status_code) >= 400:
-                raise RuntimeError(f"HTTP {status_code}")
-          except urllib.error.HTTPError as error:
-            body = error.read().decode("utf-8", errors="replace")
-            raise SystemExit(f"Discord webhook request failed: HTTP {error.code}; {body[:400]}")
-          except Exception as error:
-            raise SystemExit(f"Discord webhook request failed: {error}")
+          print(json.dumps({"content": "\n".join(lines)}, ensure_ascii=False))
           PY
+
+          curl --fail --silent --show-error \
+            --retry 3 \
+            --retry-delay 1 \
+            -H "Content-Type: application/json" \
+            --data-binary @"$payload_file" \
+            "$DISCORD_WEBHOOK_URL"
