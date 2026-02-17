@@ -55,6 +55,11 @@ on:
         required: false
         type: string
         default: ''
+      discord_webhook_map:
+        description: 'Optional newline-separated GitHub login to Discord webhook map (login=https://discord.com/api/webhooks/...).'
+        required: false
+        type: string
+        default: ''
     secrets:
       CODEX_GITHUB_APP_ID:
         required: true
@@ -71,6 +76,8 @@ on:
       EXTRA_SECRET_ENV_4:
         required: false
       EXTRA_SECRET_ENV_5:
+        required: false
+      DISCORD_WEBHOOK_MAP:
         required: false
 
 jobs:
@@ -1389,6 +1396,7 @@ jobs:
             output.write(f"prompt_file={output_path}\n")
             output.write(f"assistant_name={assistant_name}\n")
             output.write(f"assistant_slug={assistant_slug}\n")
+            output.write(f"trigger_login={trigger_login}\n")
           PY
 
       - name: Post Codex start comment
@@ -1688,6 +1696,7 @@ jobs:
           echo "wip_pushed=true" >> "$GITHUB_OUTPUT"
 
       - name: Post Codex response
+        id: post_response
         if: always()
         uses: actions/github-script@v7
         env:
@@ -1713,6 +1722,17 @@ jobs:
             const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
             const isCancelled = process.env.JOB_CANCELLED === 'true';
             const assistantName = process.env.ASSISTANT_NAME || 'Codex';
+            const issueNumber =
+              context.eventName === 'issue_comment' || context.eventName === 'issues'
+                ? context.payload.issue?.number
+                : context.payload.pull_request?.number;
+
+            let jobUrl = process.env.START_COMMENT_JOB_URL;
+            if (!jobUrl) {
+              jobUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            }
+            core.setOutput('job_url', jobUrl);
+
             const formatDuration = (totalSeconds) => {
               if (!Number.isFinite(totalSeconds) || totalSeconds < 0) {
                 return null;
@@ -1750,6 +1770,16 @@ jobs:
               return;
             }
 
+            const commentUrl =
+              issueNumber && Number.isFinite(Number(issueNumber))
+                ? `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/issues/${issueNumber}#issuecomment-${commentId}`
+                : '';
+            const setCommentUrlOutput = () => {
+              if (commentUrl) {
+                core.setOutput('comment_url', commentUrl);
+              }
+            };
+
             const wipCancelSalvage = process.env.CODEX_WIP_CANCEL_SALVAGE === 'true';
             if (isCancelled && !wipCancelSalvage) {
               // On cancellation, remove the placeholder "Codex is running..." comment.
@@ -1763,11 +1793,6 @@ jobs:
                 core.warning(`Failed to delete start comment on cancellation: ${error.message}`);
               }
               return;
-            }
-
-            let jobUrl = process.env.START_COMMENT_JOB_URL;
-            if (!jobUrl) {
-              jobUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
             }
 
             const codexOutcome = process.env.CODEX_STEP_OUTCOME;
@@ -1796,6 +1821,7 @@ jobs:
                 body += '\n\n⚠️ Cancellation exceeded the salvage threshold, but no WIP branch was created.';
               }
 
+              setCommentUrlOutput();
               await updateCommentWithRetry({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
@@ -1817,6 +1843,7 @@ jobs:
                   }
                 }
               }
+              setCommentUrlOutput();
               await updateCommentWithRetry({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
@@ -1829,6 +1856,7 @@ jobs:
             const outputFile = process.env.CODEX_OUTPUT_FILE;
             if (!outputFile || !fs.existsSync(outputFile)) {
               const body = `❌ ${assistantName} run failed: ${jobUrl}`;
+              setCommentUrlOutput();
               await updateCommentWithRetry({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
@@ -1843,6 +1871,7 @@ jobs:
             output = output.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
             if (!output.replace(/[ \t\n]+/g, '')) {
               const body = `❌ ${assistantName} run failed: ${jobUrl}`;
+              setCommentUrlOutput();
               await updateCommentWithRetry({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
@@ -1866,9 +1895,191 @@ jobs:
               ? `[run](${jobUrl})\n\n${visibleOutput}`
               : `[run](${jobUrl})\n\n(No public output from ${assistantName}.)`;
 
-              await updateCommentWithRetry({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                comment_id: Number(commentId),
-                body
-              });
+            setCommentUrlOutput();
+            await updateCommentWithRetry({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: Number(commentId),
+              body
+            });
+
+      - name: Resolve Discord webhook for trigger user
+        id: discord_webhook
+        if: always()
+        uses: actions/github-script@v7
+        env:
+          TRIGGER_LOGIN: ${{ steps.prompt.outputs.trigger_login }}
+          DISCORD_WEBHOOK_MAP_INPUT: ${{ inputs.discord_webhook_map }}
+          DISCORD_WEBHOOK_MAP_SECRET: ${{ secrets.DISCORD_WEBHOOK_MAP }}
+        with:
+          script: |
+            const normalizeLogin = (value) =>
+              String(value || '')
+                .trim()
+                .replace(/^@/, '')
+                .toLowerCase();
+
+            const parseWebhookMap = (raw) => {
+              const normalized = String(raw || '').trim();
+              if (!normalized) {
+                return {};
+              }
+
+              const appendEntry = (target, key, value) => {
+                const login = normalizeLogin(key);
+                const webhook = String(value || '').trim();
+                if (!login || !webhook) {
+                  return;
+                }
+                target[login] = webhook;
+              };
+
+              if (normalized.startsWith('{')) {
+                try {
+                  const parsed = JSON.parse(normalized);
+                  if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+                    const mapped = {};
+                    for (const [key, value] of Object.entries(parsed)) {
+                      appendEntry(mapped, key, value);
+                    }
+                    return mapped;
+                  }
+                  core.warning('discord_webhook_map JSON must be an object; ignoring payload.');
+                  return {};
+                } catch (error) {
+                  core.warning(`Unable to parse discord_webhook_map JSON payload: ${error.message}`);
+                }
+              }
+
+              const mapped = {};
+              const lines = normalized.split(/\r?\n/);
+              for (let i = 0; i < lines.length; i += 1) {
+                const line = lines[i].trim();
+                if (!line || line.startsWith('#')) {
+                  continue;
+                }
+                const separatorIndex = line.indexOf('=');
+                if (separatorIndex <= 0) {
+                  core.warning(`Ignoring invalid discord_webhook_map line ${i + 1}; expected login=url.`);
+                  continue;
+                }
+                appendEntry(
+                  mapped,
+                  line.slice(0, separatorIndex),
+                  line.slice(separatorIndex + 1)
+                );
+              }
+              return mapped;
+            };
+
+            const webhookMap = {
+              ...parseWebhookMap(process.env.DISCORD_WEBHOOK_MAP_INPUT || ''),
+              ...parseWebhookMap(process.env.DISCORD_WEBHOOK_MAP_SECRET || ''),
+            };
+
+            const triggerLogin = normalizeLogin(process.env.TRIGGER_LOGIN || '');
+            core.setOutput('trigger_login', triggerLogin);
+            if (!triggerLogin) {
+              core.info('Trigger login missing; Discord notification disabled.');
+              return;
+            }
+
+            const webhookUrl = webhookMap[triggerLogin] || '';
+            if (!webhookUrl) {
+              core.info(`No Discord webhook mapping found for @${triggerLogin}; skipping notification.`);
+              return;
+            }
+
+            let parsedUrl = null;
+            try {
+              parsedUrl = new URL(webhookUrl);
+            } catch (error) {
+              core.warning(`Invalid Discord webhook URL for @${triggerLogin}: ${error.message}`);
+              return;
+            }
+
+            const hostname = parsedUrl.hostname.toLowerCase();
+            const isDiscordHost =
+              hostname === 'discord.com' ||
+              hostname.endsWith('.discord.com') ||
+              hostname === 'discordapp.com' ||
+              hostname.endsWith('.discordapp.com');
+            const isWebhookPath = parsedUrl.pathname.startsWith('/api/webhooks/');
+
+            if (parsedUrl.protocol !== 'https:' || !isDiscordHost || !isWebhookPath) {
+              core.warning(`Rejected non-Discord webhook URL for @${triggerLogin}.`);
+              return;
+            }
+
+            core.setSecret(webhookUrl);
+            core.setOutput('webhook_url', webhookUrl);
+            core.info(`Discord webhook resolved for @${triggerLogin}.`);
+
+      - name: Post Discord completion notification
+        if: ${{ always() && steps.discord_webhook.outputs.webhook_url != '' && steps.post_response.outputs.comment_url != '' }}
+        shell: bash
+        env:
+          DISCORD_WEBHOOK_URL: ${{ steps.discord_webhook.outputs.webhook_url }}
+          TRIGGER_LOGIN: ${{ steps.discord_webhook.outputs.trigger_login }}
+          COMMENT_URL: ${{ steps.post_response.outputs.comment_url }}
+          JOB_URL: ${{ steps.post_response.outputs.job_url }}
+          ASSISTANT_NAME: ${{ steps.prompt.outputs.assistant_name }}
+          CODEX_STEP_OUTCOME: ${{ steps.codex.outcome }}
+          JOB_STATUS: ${{ job.status }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import json
+          import os
+          import urllib.error
+          import urllib.request
+
+          webhook_url = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
+          if not webhook_url:
+            raise SystemExit(0)
+
+          assistant_name = (os.environ.get("ASSISTANT_NAME", "") or "Codex").strip()
+          trigger_login = (os.environ.get("TRIGGER_LOGIN", "") or "").strip()
+          repository = (os.environ.get("REPOSITORY", "") or "").strip()
+          comment_url = (os.environ.get("COMMENT_URL", "") or "").strip()
+          job_url = (os.environ.get("JOB_URL", "") or "").strip()
+          codex_outcome = (os.environ.get("CODEX_STEP_OUTCOME", "") or "").strip().lower()
+          job_status = (os.environ.get("JOB_STATUS", "") or "").strip().lower()
+
+          if job_status == "cancelled":
+            status = "canceled"
+          elif codex_outcome == "success":
+            status = "completed successfully"
+          else:
+            status = "failed"
+
+          actor = f"@{trigger_login}" if trigger_login else "the trigger user"
+          lines = [
+            f"{assistant_name} run {status}.",
+            f"Repo: {repository}",
+            f"Requested by: {actor}",
+            f"Comment: {comment_url}",
+          ]
+          if job_url:
+            lines.append(f"Run: {job_url}")
+
+          payload = json.dumps({"content": "\n".join(lines)}, ensure_ascii=False).encode("utf-8")
+          request = urllib.request.Request(
+            webhook_url,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+          )
+          try:
+            with urllib.request.urlopen(request, timeout=20) as response:
+              status_code = getattr(response, "status", response.getcode())
+              if int(status_code) >= 400:
+                raise RuntimeError(f"HTTP {status_code}")
+          except urllib.error.HTTPError as error:
+            body = error.read().decode("utf-8", errors="replace")
+            raise SystemExit(f"Discord webhook request failed: HTTP {error.code}; {body[:400]}")
+          except Exception as error:
+            raise SystemExit(f"Discord webhook request failed: {error}")
+          PY
