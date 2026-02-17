@@ -1440,6 +1440,7 @@ jobs:
 
             core.setOutput('comment_id', String(comment.data.id));
             core.setOutput('job_url', jobUrl);
+            core.setOutput('started_at_epoch', String(Math.floor(Date.now() / 1000)));
 
       - name: Run Codex
         id: codex
@@ -1566,7 +1567,7 @@ jobs:
           "$CODEX_PATH" exec --model "$CODEX_MODEL" --yolo "$TASK" > "$OUTPUT_FILE"
           echo "output_file=$OUTPUT_FILE" >> "$GITHUB_OUTPUT"
 
-      - name: Commit & push WIP changes if Codex failed
+      - name: Commit & push WIP changes if Codex failed or long cancellation
         id: wip_push
         # When Codex fails (429, token limits, crashes, etc.), preserve any work already applied
         # to the workspace by committing and pushing it to a new `codex/wip/...` branch.
@@ -1575,7 +1576,7 @@ jobs:
         #
         # SAFETY:
         # - Never force-push.
-        if: ${{ always() && steps.codex.outcome == 'failure' }}
+        if: ${{ always() && (steps.codex.outcome == 'failure' || job.status == 'cancelled') }}
         shell: bash
         env:
           ASSISTANT_NAME: ${{ steps.prompt.outputs.assistant_name }}
@@ -1583,6 +1584,9 @@ jobs:
           TARGET_BRANCH: ${{ steps.branch.outputs.branch }}
           CODEX_STEP_OUTCOME: ${{ steps.codex.outcome }}
           JOB_URL: ${{ steps.start_comment.outputs.job_url }}
+          JOB_CANCELLED: ${{ job.status == 'cancelled' }}
+          START_COMMENT_EPOCH: ${{ steps.start_comment.outputs.started_at_epoch }}
+          WIP_CANCEL_THRESHOLD_SECONDS: '180'
         run: |
           set -euo pipefail
 
@@ -1594,8 +1598,36 @@ jobs:
           assistant_name="${ASSISTANT_NAME:-Codex}"
           assistant_slug="${ASSISTANT_SLUG:-codex}"
           job_url="${JOB_URL:-unknown}"
+          job_cancelled="${JOB_CANCELLED:-false}"
+          start_comment_epoch="${START_COMMENT_EPOCH:-}"
+          cancel_threshold="${WIP_CANCEL_THRESHOLD_SECONDS:-180}"
           run_id="${GITHUB_RUN_ID:-unknown}"
           run_attempt="${GITHUB_RUN_ATTEMPT:-0}"
+          now_epoch="$(date +%s)"
+          elapsed_seconds=0
+
+          if [[ "$start_comment_epoch" =~ ^[0-9]+$ ]] && [[ "$now_epoch" =~ ^[0-9]+$ ]]; then
+            elapsed_seconds=$((now_epoch - start_comment_epoch))
+            if [ "$elapsed_seconds" -lt 0 ]; then
+              elapsed_seconds=0
+            fi
+          fi
+
+          {
+            echo "wip_pushed=false"
+            echo "wip_cancel_salvage=false"
+            echo "wip_elapsed_seconds=${elapsed_seconds}"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ "$job_cancelled" = "true" ] && [ "$elapsed_seconds" -lt "$cancel_threshold" ]; then
+            echo "Skipping WIP salvage: job canceled after ${elapsed_seconds}s (< ${cancel_threshold}s threshold)."
+            echo "wip_skip_reason=cancelled_before_threshold" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$job_cancelled" = "true" ]; then
+            echo "wip_cancel_salvage=true" >> "$GITHUB_OUTPUT"
+          fi
 
           echo "${assistant_name} outcome: ${outcome}"
           echo "git HEAD branch: ${head_branch}"
@@ -1623,14 +1655,17 @@ jobs:
           {
             echo "wip_branch=$wip_branch"
             echo "wip_branch_url=$wip_branch_url"
-            echo "wip_pushed=false"
           } >> "$GITHUB_OUTPUT"
 
           # If there are uncommitted changes, commit them before pushing to the WIP branch.
           if [ -n "$(git status --porcelain)" ]; then
             git add -A
             if [ -n "$(git status --porcelain)" ]; then
-              commit_subject="WIP: save ${assistant_name} progress after failure"
+              commit_reason="failure"
+              if [ "$job_cancelled" = "true" ]; then
+                commit_reason="cancellation"
+              fi
+              commit_subject="WIP: save ${assistant_name} progress after ${commit_reason}"
               git commit \
                 -m "$commit_subject" \
                 -m "${assistant_name} outcome: ${outcome}" \
@@ -1664,6 +1699,8 @@ jobs:
           CODEX_WIP_BRANCH_URL: ${{ steps.wip_push.outputs.wip_branch_url }}
           CODEX_WIP_PUSHED: ${{ steps.wip_push.outputs.wip_pushed }}
           CODEX_WIP_ERROR: ${{ steps.wip_push.outputs.wip_error }}
+          CODEX_WIP_CANCEL_SALVAGE: ${{ steps.wip_push.outputs.wip_cancel_salvage }}
+          CODEX_WIP_ELAPSED_SECONDS: ${{ steps.wip_push.outputs.wip_elapsed_seconds }}
           JOB_CANCELLED: ${{ job.status == 'cancelled' }}
           ASSISTANT_NAME: ${{ steps.prompt.outputs.assistant_name }}
           GITHUB_TOKEN: ${{ secrets.CODEX_GH_TOKEN }}
@@ -1676,6 +1713,17 @@ jobs:
             const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
             const isCancelled = process.env.JOB_CANCELLED === 'true';
             const assistantName = process.env.ASSISTANT_NAME || 'Codex';
+            const formatDuration = (totalSeconds) => {
+              if (!Number.isFinite(totalSeconds) || totalSeconds < 0) {
+                return null;
+              }
+              const minutes = Math.floor(totalSeconds / 60);
+              const seconds = totalSeconds % 60;
+              if (minutes > 0) {
+                return `${minutes}m ${seconds}s`;
+              }
+              return `${seconds}s`;
+            };
             const updateCommentWithRetry = async (params, retries = 2) => {
               for (let attempt = 0; attempt <= retries; attempt++) {
                 try {
@@ -1695,14 +1743,15 @@ jobs:
             const commentId = process.env.START_COMMENT_ID;
             if (!commentId) {
               if (isCancelled) {
-                core.info('Start comment ID missing on cancellation; nothing to delete.');
+                core.info('Start comment ID missing on cancellation; nothing to update or delete.');
                 return;
               }
               core.setFailed('Start comment ID not found; cannot update comment.');
               return;
             }
 
-            if (isCancelled) {
+            const wipCancelSalvage = process.env.CODEX_WIP_CANCEL_SALVAGE === 'true';
+            if (isCancelled && !wipCancelSalvage) {
               // On cancellation, remove the placeholder "Codex is running..." comment.
               try {
                 await github.rest.issues.deleteComment({
@@ -1726,6 +1775,35 @@ jobs:
             const wipBranchUrl = process.env.CODEX_WIP_BRANCH_URL;
             const wipPushed = process.env.CODEX_WIP_PUSHED === 'true';
             const wipError = process.env.CODEX_WIP_ERROR;
+            const wipElapsedSeconds = Number.parseInt(process.env.CODEX_WIP_ELAPSED_SECONDS || '', 10);
+            if (isCancelled) {
+              const elapsedText = formatDuration(wipElapsedSeconds);
+              let body = elapsedText
+                ? `⚠️ ${assistantName} run was canceled after ${elapsedText}: ${jobUrl}`
+                : `⚠️ ${assistantName} run was canceled: ${jobUrl}`;
+
+              if (wipBranch) {
+                if (wipPushed) {
+                  const branchRef = wipBranchUrl ? `[\`${wipBranch}\`](${wipBranchUrl})` : `\`${wipBranch}\``;
+                  body += `\n\n🧷 WIP branch pushed: ${branchRef}\n\nOriginal branch was not modified.`;
+                } else {
+                  body += `\n\n⚠️ WIP branch push attempted but failed: \`${wipBranch}\``;
+                  if (wipError) {
+                    body += `\n${wipError}`;
+                  }
+                }
+              } else {
+                body += '\n\n⚠️ Cancellation exceeded the salvage threshold, but no WIP branch was created.';
+              }
+
+              await updateCommentWithRetry({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: Number(commentId),
+                body
+              });
+              return;
+            }
             if (codexOutcome !== 'success') {
               let body = `❌ ${assistantName} run failed: ${jobUrl}`;
               if (wipBranch) {
