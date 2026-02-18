@@ -1,0 +1,663 @@
+name: Discord Check Notify
+description: Send Discord bridge check status updates for pull request workflows
+
+inputs:
+    gh_webhook_secret:
+        description: Shared HMAC secret used to sign bridge payloads
+        required: false
+        default: ''
+    discord_bridge_url:
+        description: Signed bridge endpoint URL
+        required: true
+    discord_channel_map:
+        description: Optional newline-separated GitHub login to Discord channel map
+        required: false
+        default: ''
+    source_workflow_name:
+        description: Display name of source workflow
+        required: false
+        default: ''
+    upstream_result:
+        description: Result state to emit (started|success|failure|cancelled|skipped)
+        required: true
+    notify_conclusions:
+        description: Comma/newline-separated conclusions to notify
+        required: false
+        default: success,failure,cancelled
+    suppress_notifications:
+        description: When true, request silent Discord delivery
+        required: false
+        default: 'false'
+    trigger_login:
+        description: Preferred GitHub login for channel mapping; defaults to PR author
+        required: false
+        default: ''
+    issue_number:
+        description: Issue/PR number; defaults to pull_request.number from event
+        required: false
+        default: '0'
+    issue_type:
+        description: issue or pull_request
+        required: false
+        default: pull_request
+    thread_title:
+        description: Thread title; defaults to PR title from event
+        required: false
+        default: ''
+    thread_url:
+        description: Thread URL; defaults to PR URL from event
+        required: false
+        default: ''
+    require_existing_thread:
+        description: When true, bridge only posts if thread already exists
+        required: false
+        default: 'true'
+    assistant_name:
+        description: Assistant display name in bridge payload
+        required: false
+        default: Checks
+    assistant_slug:
+        description: Assistant slug in bridge payload
+        required: false
+        default: checks
+
+runs:
+    using: composite
+    steps:
+        - name: Build check notification context
+          id: context
+          uses: actions/github-script@v7
+          env:
+              INPUT_DISCORD_CHANNEL_MAP: ${{ inputs.discord_channel_map }}
+              INPUT_SOURCE_WORKFLOW_NAME: ${{ inputs.source_workflow_name }}
+              INPUT_UPSTREAM_RESULT: ${{ inputs.upstream_result }}
+              INPUT_NOTIFY_CONCLUSIONS: ${{ inputs.notify_conclusions }}
+              INPUT_TRIGGER_LOGIN: ${{ inputs.trigger_login }}
+              INPUT_ISSUE_NUMBER: ${{ inputs.issue_number }}
+              INPUT_ISSUE_TYPE: ${{ inputs.issue_type }}
+              INPUT_THREAD_TITLE: ${{ inputs.thread_title }}
+              INPUT_THREAD_URL: ${{ inputs.thread_url }}
+              INPUT_ASSISTANT_NAME: ${{ inputs.assistant_name }}
+          with:
+              script: |
+                  const normalizeLogin = (value) =>
+                    String(value || '')
+                      .trim()
+                      .replace(/^@/, '')
+                      .toLowerCase();
+
+                  const parseMap = (raw) => {
+                    const normalized = String(raw || '').trim();
+                    if (!normalized) {
+                      return {};
+                    }
+
+                    const appendEntry = (target, key, value) => {
+                      const login = normalizeLogin(key);
+                      const channelId = String(value || '').trim();
+                      if (!login || !channelId) {
+                        return;
+                      }
+                      target[login] = channelId;
+                    };
+
+                    if (normalized.startsWith('{')) {
+                      try {
+                        const parsed = JSON.parse(normalized);
+                        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+                          const mapped = {};
+                          for (const [key, value] of Object.entries(parsed)) {
+                            appendEntry(mapped, key, value);
+                          }
+                          return mapped;
+                        }
+                        core.warning('Discord channel map JSON must be an object; ignoring payload.');
+                        return {};
+                      } catch (error) {
+                        core.warning(`Unable to parse Discord channel map JSON: ${error.message}`);
+                      }
+                    }
+
+                    const mapped = {};
+                    const lines = normalized.split(/\r?\n/);
+                    for (let i = 0; i < lines.length; i += 1) {
+                      const line = lines[i].trim();
+                      if (!line || line.startsWith('#')) {
+                        continue;
+                      }
+                      const separatorIndex = line.indexOf('=');
+                      if (separatorIndex <= 0) {
+                        core.warning(`Ignoring invalid Discord channel map line ${i + 1}; expected login=channel_id.`);
+                        continue;
+                      }
+                      appendEntry(
+                        mapped,
+                        line.slice(0, separatorIndex),
+                        line.slice(separatorIndex + 1),
+                      );
+                    }
+
+                    return mapped;
+                  };
+
+                  const unique = (values) => {
+                    const seen = new Set();
+                    const out = [];
+                    for (const value of values) {
+                      const normalized = String(value || '').trim();
+                      if (!normalized || seen.has(normalized)) {
+                        continue;
+                      }
+                      seen.add(normalized);
+                      out.push(normalized);
+                    }
+                    return out;
+                  };
+
+                  const parseConclusions = (raw) =>
+                    unique(
+                      String(raw || '')
+                        .split(/[\s,\n]+/)
+                        .map((item) => item.trim().toLowerCase())
+                        .filter(Boolean),
+                    );
+
+                  const parseIssueNumber = (value) => {
+                    const parsed = Number.parseInt(String(value || '').trim(), 10);
+                    if (Number.isFinite(parsed) && parsed > 0) {
+                      return parsed;
+                    }
+                    return 0;
+                  };
+
+                  const parseIssueReferencesFromText = ({ text, repositoryFullName }) => {
+                    const normalizedRepo = String(repositoryFullName || '').trim().toLowerCase();
+                    const content = String(text || '');
+                    const results = [];
+                    const seen = new Set();
+                    const pattern = /(?:([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)#|#)(\d+)\b/g;
+                    let match;
+                    while ((match = pattern.exec(content)) !== null) {
+                      const referencedRepo = String(match[1] || '').trim().toLowerCase();
+                      if (referencedRepo && referencedRepo !== normalizedRepo) {
+                        continue;
+                      }
+                      const issueNumber = Number.parseInt(String(match[2] || ''), 10);
+                      if (!Number.isFinite(issueNumber) || issueNumber <= 0) {
+                        continue;
+                      }
+                      if (seen.has(issueNumber)) {
+                        continue;
+                      }
+                      seen.add(issueNumber);
+                      results.push(issueNumber);
+                    }
+
+                    const issueUrlPattern = /https:\/\/github\.com\/([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\/issues\/(\d+)\b/gi;
+                    while ((match = issueUrlPattern.exec(content)) !== null) {
+                      const referencedRepo = String(match[1] || '').trim().toLowerCase();
+                      if (referencedRepo && referencedRepo !== normalizedRepo) {
+                        continue;
+                      }
+                      const issueNumber = Number.parseInt(String(match[2] || ''), 10);
+                      if (!Number.isFinite(issueNumber) || issueNumber <= 0) {
+                        continue;
+                      }
+                      if (seen.has(issueNumber)) {
+                        continue;
+                      }
+                      seen.add(issueNumber);
+                      results.push(issueNumber);
+                    }
+
+                    return results;
+                  };
+
+                  const upstreamResult = String(process.env.INPUT_UPSTREAM_RESULT || '')
+                    .trim()
+                    .toLowerCase();
+                  const allowedConclusions = parseConclusions(
+                    process.env.INPUT_NOTIFY_CONCLUSIONS || 'success,failure,cancelled',
+                  );
+                  const shouldNotify = allowedConclusions.includes(upstreamResult);
+
+                  const pullRequest = context.payload?.pull_request || {};
+                  const issueNumber =
+                    parseIssueNumber(process.env.INPUT_ISSUE_NUMBER) ||
+                    parseIssueNumber(pullRequest.number);
+                  const issueType = String(process.env.INPUT_ISSUE_TYPE || '').trim() || 'pull_request';
+                  const threadTitle =
+                    String(process.env.INPUT_THREAD_TITLE || '').trim() ||
+                    String(pullRequest.title || '').trim();
+                  const threadUrl =
+                    String(process.env.INPUT_THREAD_URL || '').trim() ||
+                    String(pullRequest.html_url || '').trim();
+                  const triggerLogin = normalizeLogin(
+                    process.env.INPUT_TRIGGER_LOGIN || pullRequest?.user?.login || context.actor || '',
+                  );
+
+                  const channelMap = parseMap(process.env.INPUT_DISCORD_CHANNEL_MAP || '');
+                  const candidateChannelIds = unique(Object.values(channelMap));
+                  const preferredChannelId = triggerLogin ? (channelMap[triggerLogin] || '') : '';
+
+                  const fallbackIssueCandidates = [];
+                  const fallbackSeen = new Set();
+                  const appendFallbackIssue = (value) => {
+                    const number = Number.parseInt(String(value || '').trim(), 10);
+                    if (!Number.isFinite(number) || number <= 0 || number === issueNumber) {
+                      return;
+                    }
+                    if (fallbackSeen.has(number)) {
+                      return;
+                    }
+                    fallbackSeen.add(number);
+                    fallbackIssueCandidates.push(number);
+                  };
+
+                  if (issueType === 'pull_request' && issueNumber > 0) {
+                    let pullRequestBodyForParsing = pullRequest?.body || '';
+                    let graphQlResolved = false;
+                    let graphQlErrorMessage = '';
+
+                    for (let attempt = 1; attempt <= 3; attempt += 1) {
+                      try {
+                        const response = await github.graphql(
+                          `
+                            query PullRequestClosingIssues($owner: String!, $repo: String!, $number: Int!) {
+                              repository(owner: $owner, name: $repo) {
+                                pullRequest(number: $number) {
+                                  closingIssuesReferences(first: 20) {
+                                    nodes {
+                                      number
+                                      repository {
+                                        nameWithOwner
+                                      }
+                                    }
+                                  }
+                                  body
+                                }
+                              }
+                            }
+                          `,
+                          {
+                            owner: context.repo.owner,
+                            repo: context.repo.repo,
+                            number: issueNumber,
+                          },
+                        );
+
+                        const pullRequestNode = response?.repository?.pullRequest || null;
+                        const linkedIssues = Array.isArray(pullRequestNode?.closingIssuesReferences?.nodes)
+                          ? pullRequestNode.closingIssuesReferences.nodes
+                          : [];
+                        for (const linkedIssue of linkedIssues) {
+                          const linkedRepo = String(linkedIssue?.repository?.nameWithOwner || '').trim().toLowerCase();
+                          const currentRepo = `${context.repo.owner}/${context.repo.repo}`.toLowerCase();
+                          if (linkedRepo && linkedRepo !== currentRepo) {
+                            continue;
+                          }
+                          appendFallbackIssue(linkedIssue?.number);
+                        }
+
+                        pullRequestBodyForParsing = pullRequestNode?.body || pullRequest?.body || '';
+                        graphQlResolved = true;
+                        break;
+                      } catch (error) {
+                        graphQlErrorMessage = error?.message || String(error);
+                        if (attempt < 3) {
+                          await new Promise((resolve) => setTimeout(resolve, attempt * 250));
+                        }
+                      }
+                    }
+
+                    if (!graphQlResolved && graphQlErrorMessage) {
+                      core.warning(`Unable to resolve PR-linked issues for fallback thread routing: ${graphQlErrorMessage}`);
+                    }
+
+                    const textIssueRefs = parseIssueReferencesFromText({
+                      text: pullRequestBodyForParsing || pullRequest?.body || '',
+                      repositoryFullName: `${context.repo.owner}/${context.repo.repo}`,
+                    });
+                    for (const referencedIssueNumber of textIssueRefs) {
+                      appendFallbackIssue(referencedIssueNumber);
+                    }
+
+                    const titleIssueRefs = parseIssueReferencesFromText({
+                      text: pullRequest?.title || '',
+                      repositoryFullName: `${context.repo.owner}/${context.repo.repo}`,
+                    });
+                    for (const referencedIssueNumber of titleIssueRefs) {
+                      appendFallbackIssue(referencedIssueNumber);
+                    }
+
+                    try {
+                      const timelineEvents = await github.paginate(
+                        github.rest.issues.listEventsForTimeline,
+                        {
+                          owner: context.repo.owner,
+                          repo: context.repo.repo,
+                          issue_number: issueNumber,
+                          per_page: 100,
+                        },
+                      );
+                      const allowedEventTypes = new Set(['cross-referenced', 'connected', 'referenced']);
+                      const currentRepo = `${context.repo.owner}/${context.repo.repo}`.toLowerCase();
+                      for (const timelineEvent of timelineEvents) {
+                        const eventType = String(timelineEvent?.event || '').trim().toLowerCase();
+                        if (eventType && !allowedEventTypes.has(eventType)) {
+                          continue;
+                        }
+
+                        const sourceIssue = timelineEvent?.source?.issue || null;
+                        if (!sourceIssue || sourceIssue?.pull_request) {
+                          continue;
+                        }
+
+                        let sourceRepo = '';
+                        const repositoryUrl = String(sourceIssue?.repository_url || '').trim();
+                        const repoMatch = /\/repos\/([^/]+\/[^/]+)$/.exec(repositoryUrl);
+                        if (repoMatch && repoMatch[1]) {
+                          sourceRepo = String(repoMatch[1]).toLowerCase();
+                        }
+                        if (sourceRepo && sourceRepo !== currentRepo) {
+                          continue;
+                        }
+
+                        appendFallbackIssue(sourceIssue?.number);
+                      }
+                    } catch (error) {
+                      core.warning(`Unable to resolve PR-linked issue timeline references: ${error?.message || String(error)}`);
+                    }
+                  }
+
+                  const fallbackIssueNumber = fallbackIssueCandidates.length > 0
+                    ? fallbackIssueCandidates[0]
+                    : 0;
+
+                  const iconMap = {
+                    started: '⏳',
+                    success: '✅',
+                    failure: '❌',
+                    cancelled: '⚪',
+                    skipped: '⚪',
+                  };
+                  const statusLabelMap = {
+                    started: 'Started',
+                    success: 'Success',
+                    failure: 'Failure',
+                    cancelled: 'Cancelled',
+                    skipped: 'Skipped',
+                  };
+                  const workflowName =
+                    String(process.env.INPUT_SOURCE_WORKFLOW_NAME || '').trim() ||
+                    context.workflow ||
+                    'Workflow';
+                  const icon = iconMap[upstreamResult] || 'ℹ️';
+                  const statusLabel = statusLabelMap[upstreamResult] || 'Completed';
+                  const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+
+                  let failedJobName = '';
+                  let failedStepName = '';
+                  if (upstreamResult === 'failure' || upstreamResult === 'cancelled') {
+                    try {
+                      const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, {
+                        owner: context.repo.owner,
+                        repo: context.repo.repo,
+                        run_id: context.runId,
+                        per_page: 100,
+                      });
+                      const badConclusions = new Set(['failure', 'cancelled', 'timed_out', 'action_required']);
+                      const failedJob = jobs.find((job) => badConclusions.has(String(job?.conclusion || '').toLowerCase()));
+                      if (failedJob) {
+                        failedJobName = String(failedJob.name || '').trim();
+                        const failedStep = Array.isArray(failedJob.steps)
+                          ? failedJob.steps.find((step) => String(step?.conclusion || '').toLowerCase() === 'failure')
+                          : null;
+                        if (failedStep) {
+                          failedStepName = String(failedStep.name || '').trim();
+                        }
+                      }
+                    } catch (error) {
+                      core.warning(`Unable to resolve failed job details: ${error.message}`);
+                    }
+                  }
+
+                  const primaryUrl = threadUrl || runUrl;
+                  const messageLines = [];
+                  if (upstreamResult === 'started') {
+                    messageLines.push('⏳');
+                    messageLines.push(primaryUrl);
+                  } else {
+                    messageLines.push(`${icon} ${statusLabel}`);
+                    if (failedJobName) {
+                      messageLines.push(`Failed job: ${failedJobName}`);
+                    }
+                    if (failedStepName) {
+                      messageLines.push(`Failed step: ${failedStepName}`);
+                    }
+                    messageLines.push(primaryUrl);
+                  }
+
+                  core.setOutput('should_notify', shouldNotify ? 'true' : 'false');
+                  core.setOutput('upstream_result', upstreamResult);
+                  core.setOutput('issue_number', issueNumber ? String(issueNumber) : '');
+                  core.setOutput('issue_type', issueType);
+                  core.setOutput('thread_title', threadTitle);
+                  core.setOutput('thread_url', threadUrl);
+                  core.setOutput('primary_url', primaryUrl);
+                  core.setOutput('trigger_login', triggerLogin);
+                  core.setOutput('channel_id', preferredChannelId);
+                  core.setOutput('channel_candidates_json', JSON.stringify(candidateChannelIds));
+                  core.setOutput('response_text', messageLines.join('\n'));
+                  core.setOutput('workflow_name', workflowName);
+                  core.setOutput('failed_job_name', failedJobName);
+                  core.setOutput('failed_step_name', failedStepName);
+                  core.setOutput(
+                    'fallback_issue_number',
+                    fallbackIssueNumber > 0 ? String(fallbackIssueNumber) : '',
+                  );
+                  core.setOutput(
+                    'fallback_issue_numbers_json',
+                    JSON.stringify(fallbackIssueCandidates),
+                  );
+
+        - name: Build signed bridge payload
+          if: ${{ steps.context.outputs.should_notify == 'true' }}
+          shell: bash
+          env:
+              BRIDGE_SHARED_SECRET: ${{ inputs.gh_webhook_secret }}
+              ASSISTANT_NAME: ${{ inputs.assistant_name }}
+              ASSISTANT_SLUG: ${{ inputs.assistant_slug }}
+              TRIGGER_LOGIN: ${{ steps.context.outputs.trigger_login }}
+              ISSUE_NUMBER: ${{ steps.context.outputs.issue_number }}
+              ISSUE_TYPE: ${{ steps.context.outputs.issue_type }}
+              THREAD_TITLE: ${{ steps.context.outputs.thread_title }}
+              THREAD_URL: ${{ steps.context.outputs.thread_url }}
+              PRIMARY_URL: ${{ steps.context.outputs.primary_url }}
+              DISCORD_CHANNEL_ID: ${{ steps.context.outputs.channel_id }}
+              DISCORD_CHANNEL_CANDIDATES_JSON: ${{ steps.context.outputs.channel_candidates_json }}
+              RESPONSE_TEXT: ${{ steps.context.outputs.response_text }}
+              SUPPRESS_NOTIFICATIONS: ${{ inputs.suppress_notifications }}
+              WORKFLOW_NAME: ${{ steps.context.outputs.workflow_name }}
+              WORKFLOW_RESULT: ${{ steps.context.outputs.upstream_result }}
+              FAILED_JOB_NAME: ${{ steps.context.outputs.failed_job_name }}
+              FAILED_STEP_NAME: ${{ steps.context.outputs.failed_step_name }}
+              FALLBACK_ISSUE_NUMBER: ${{ steps.context.outputs.fallback_issue_number }}
+              FALLBACK_ISSUE_NUMBERS_JSON: ${{ steps.context.outputs.fallback_issue_numbers_json }}
+              REQUIRE_EXISTING_THREAD: ${{ inputs.require_existing_thread }}
+              PAYLOAD_FILE: ${{ runner.temp }}/discord-check-bridge-payload.json
+              SIGNATURE_FILE: ${{ runner.temp }}/discord-check-bridge-signature.txt
+              DELIVERY_FILE: ${{ runner.temp }}/discord-check-bridge-delivery.txt
+          run: |
+              set -euo pipefail
+
+              if [ -z "${BRIDGE_SHARED_SECRET:-}" ]; then
+                echo "::warning::GH_WEBHOOK_SECRET is empty; skipping Discord bridge event."
+                exit 0
+              fi
+
+              python3 - <<'PY'
+              import hashlib
+              import hmac
+              import json
+              import os
+              import uuid
+              from datetime import datetime, timezone
+
+              def as_int(value: str):
+                try:
+                  parsed = int(str(value or "").strip())
+                except Exception:
+                  return None
+                return parsed if parsed > 0 else None
+
+              channel_candidates = []
+              channel_candidates_raw = os.environ.get("DISCORD_CHANNEL_CANDIDATES_JSON", "").strip()
+              if channel_candidates_raw:
+                try:
+                  parsed = json.loads(channel_candidates_raw)
+                  if isinstance(parsed, list):
+                    channel_candidates = [
+                      str(item).strip()
+                      for item in parsed
+                      if str(item).strip()
+                    ]
+                except Exception:
+                  channel_candidates = []
+
+              require_existing_thread = (
+                str(os.environ.get("REQUIRE_EXISTING_THREAD", "")).strip().lower()
+                in {"1", "true", "yes"}
+              )
+              suppress_notifications = (
+                str(os.environ.get("SUPPRESS_NOTIFICATIONS", "")).strip().lower()
+                in {"1", "true", "yes"}
+              )
+
+              run_id = os.environ.get("GITHUB_RUN_ID", "")
+              run_attempt = os.environ.get("GITHUB_RUN_ATTEMPT", "")
+              run_url = f"https://github.com/{os.environ.get('GITHUB_REPOSITORY', '')}/actions/runs/{run_id}"
+
+              primary_url = (os.environ.get("PRIMARY_URL", "") or "").strip() or run_url
+              fallback_issue_numbers = []
+              raw_fallback_issue_numbers = os.environ.get("FALLBACK_ISSUE_NUMBERS_JSON", "").strip()
+              if raw_fallback_issue_numbers:
+                try:
+                  parsed = json.loads(raw_fallback_issue_numbers)
+                  if isinstance(parsed, list):
+                    fallback_issue_numbers = []
+                    seen_fallback_issues = set()
+                    for item in parsed:
+                      parsed_number = as_int(str(item))
+                      if not parsed_number or parsed_number in seen_fallback_issues:
+                        continue
+                      seen_fallback_issues.add(parsed_number)
+                      fallback_issue_numbers.append(parsed_number)
+                except Exception:
+                  fallback_issue_numbers = []
+
+              payload = {
+                "version": "codex-discord-bridge-v1",
+                "event_kind": "check_update",
+                "repository": os.environ.get("GITHUB_REPOSITORY", ""),
+                "assistant_name": os.environ.get("ASSISTANT_NAME", "Checks"),
+                "assistant_slug": os.environ.get("ASSISTANT_SLUG", "checks"),
+                "trigger_login": os.environ.get("TRIGGER_LOGIN", ""),
+                "issue_number": as_int(os.environ.get("ISSUE_NUMBER", "")),
+                "issue_type": os.environ.get("ISSUE_TYPE", "pull_request"),
+                "thread_title": os.environ.get("THREAD_TITLE", ""),
+                "thread_url": os.environ.get("THREAD_URL", ""),
+                "discord_channel_id": os.environ.get("DISCORD_CHANNEL_ID", ""),
+                "discord_channel_candidates": channel_candidates,
+                "require_existing_thread": require_existing_thread,
+                "suppress_notifications": suppress_notifications,
+                "comment_url": primary_url,
+                "job_url": run_url,
+                "response_text": os.environ.get("RESPONSE_TEXT", ""),
+                "job_status": os.environ.get("WORKFLOW_RESULT", ""),
+                "codex_outcome": os.environ.get("WORKFLOW_RESULT", ""),
+                "run_id": run_id,
+                "run_attempt": run_attempt,
+                "fallback_issue_number": as_int(os.environ.get("FALLBACK_ISSUE_NUMBER", "")),
+                "fallback_issue_numbers": fallback_issue_numbers,
+                "workflow_name": os.environ.get("WORKFLOW_NAME", ""),
+                "workflow_result": os.environ.get("WORKFLOW_RESULT", ""),
+                "failed_job_name": os.environ.get("FAILED_JOB_NAME", ""),
+                "failed_step_name": os.environ.get("FAILED_STEP_NAME", ""),
+                "sent_at": datetime.now(timezone.utc).isoformat(),
+              }
+
+              serialized = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+              secret = os.environ.get("BRIDGE_SHARED_SECRET", "")
+              signature = "sha256=" + hmac.new(
+                secret.encode("utf-8"),
+                serialized.encode("utf-8"),
+                hashlib.sha256,
+              ).hexdigest()
+              delivery_id = str(uuid.uuid4())
+
+              with open(os.environ["PAYLOAD_FILE"], "w", encoding="utf-8") as handle:
+                handle.write(serialized)
+              with open(os.environ["SIGNATURE_FILE"], "w", encoding="utf-8") as handle:
+                handle.write(signature)
+              with open(os.environ["DELIVERY_FILE"], "w", encoding="utf-8") as handle:
+                handle.write(delivery_id)
+              PY
+
+        - name: Deliver Discord bridge event
+          if: ${{ steps.context.outputs.should_notify == 'true' }}
+          shell: bash
+          env:
+              DISCORD_BRIDGE_URL: ${{ inputs.discord_bridge_url }}
+              PAYLOAD_FILE: ${{ runner.temp }}/discord-check-bridge-payload.json
+              SIGNATURE_FILE: ${{ runner.temp }}/discord-check-bridge-signature.txt
+              DELIVERY_FILE: ${{ runner.temp }}/discord-check-bridge-delivery.txt
+              RESPONSE_FILE: ${{ runner.temp }}/discord-check-bridge-response.txt
+              CURL_STDERR_FILE: ${{ runner.temp }}/discord-check-bridge-curl-stderr.txt
+          run: |
+              set -euo pipefail
+
+              if [ -z "${DISCORD_BRIDGE_URL:-}" ]; then
+                echo "Discord bridge URL is empty; skipping bridge event."
+                exit 0
+              fi
+
+              if [ ! -s "${PAYLOAD_FILE}" ] || [ ! -s "${SIGNATURE_FILE}" ] || [ ! -s "${DELIVERY_FILE}" ]; then
+                echo "::warning::Discord bridge payload/signature files missing; skipping delivery."
+                exit 0
+              fi
+
+              signature="$(cat "${SIGNATURE_FILE}")"
+              delivery_id="$(cat "${DELIVERY_FILE}")"
+
+              set +e
+              http_code="$(
+                curl --silent --show-error \
+                  --retry 3 \
+                  --retry-delay 1 \
+                  --output "${RESPONSE_FILE}" \
+                  --write-out "%{http_code}" \
+                  -H "Content-Type: application/json" \
+                  -H "X-Hub-Signature-256: ${signature}" \
+                  -H "X-GitHub-Event: codex.bridge" \
+                  -H "X-GitHub-Delivery: ${delivery_id}" \
+                  --data-binary @"${PAYLOAD_FILE}" \
+                  "${DISCORD_BRIDGE_URL}" 2>"${CURL_STDERR_FILE}"
+              )"
+              curl_status="$?"
+              set -e
+
+              if [ "${curl_status}" -ne 0 ]; then
+                curl_output="$(cat "${CURL_STDERR_FILE}" 2>/dev/null || true)"
+                echo "::warning::Discord bridge delivery failed (exit ${curl_status}): ${curl_output}"
+                exit 0
+              fi
+
+              if ! [[ "${http_code}" =~ ^[0-9]{3}$ ]] || [ "${http_code}" -lt 200 ] || [ "${http_code}" -ge 300 ]; then
+                response_body="$(cat "${RESPONSE_FILE}" 2>/dev/null || true)"
+                if [ -z "${response_body}" ]; then
+                  response_body="<empty response body>"
+                fi
+                echo "::warning::Discord bridge delivery failed (HTTP ${http_code}): ${response_body}"
+                exit 0
+              fi
