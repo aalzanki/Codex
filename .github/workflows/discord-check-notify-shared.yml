@@ -198,14 +198,14 @@ jobs:
               return 0;
             };
 
-            const parseIssueReferencesFromBody = ({ body, repositoryFullName }) => {
+            const parseIssueReferencesFromText = ({ text, repositoryFullName }) => {
               const normalizedRepo = String(repositoryFullName || '').trim().toLowerCase();
-              const text = String(body || '');
+              const content = String(text || '');
               const results = [];
               const seen = new Set();
               const pattern = /(?:([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)#|#)(\d+)\b/g;
               let match;
-              while ((match = pattern.exec(text)) !== null) {
+              while ((match = pattern.exec(content)) !== null) {
                 const referencedRepo = String(match[1] || '').trim().toLowerCase();
                 if (referencedRepo && referencedRepo !== normalizedRepo) {
                   continue;
@@ -220,6 +220,24 @@ jobs:
                 seen.add(issueNumber);
                 results.push(issueNumber);
               }
+
+              const issueUrlPattern = /https:\/\/github\.com\/([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\/issues\/(\d+)\b/gi;
+              while ((match = issueUrlPattern.exec(content)) !== null) {
+                const referencedRepo = String(match[1] || '').trim().toLowerCase();
+                if (referencedRepo && referencedRepo !== normalizedRepo) {
+                  continue;
+                }
+                const issueNumber = Number.parseInt(String(match[2] || ''), 10);
+                if (!Number.isFinite(issueNumber) || issueNumber <= 0) {
+                  continue;
+                }
+                if (seen.has(issueNumber)) {
+                  continue;
+                }
+                seen.add(issueNumber);
+                results.push(issueNumber);
+              }
+
               return results;
             };
 
@@ -327,12 +345,59 @@ jobs:
                 core.warning(`Unable to resolve PR-linked issues for fallback thread routing: ${graphQlErrorMessage}`);
               }
 
-              const bodyIssueRefs = parseIssueReferencesFromBody({
-                body: pullRequestBodyForParsing || pullRequest?.body || '',
+              const textIssueRefs = parseIssueReferencesFromText({
+                text: pullRequestBodyForParsing || pullRequest?.body || '',
                 repositoryFullName: `${context.repo.owner}/${context.repo.repo}`,
               });
-              for (const referencedIssueNumber of bodyIssueRefs) {
+              for (const referencedIssueNumber of textIssueRefs) {
                 appendFallbackIssue(referencedIssueNumber);
+              }
+
+              const titleIssueRefs = parseIssueReferencesFromText({
+                text: pullRequest?.title || '',
+                repositoryFullName: `${context.repo.owner}/${context.repo.repo}`,
+              });
+              for (const referencedIssueNumber of titleIssueRefs) {
+                appendFallbackIssue(referencedIssueNumber);
+              }
+
+              try {
+                const timelineEvents = await github.paginate(
+                  github.rest.issues.listEventsForTimeline,
+                  {
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: issueNumber,
+                    per_page: 100,
+                  },
+                );
+                const allowedEventTypes = new Set(['cross-referenced', 'connected', 'referenced']);
+                const currentRepo = `${context.repo.owner}/${context.repo.repo}`.toLowerCase();
+                for (const timelineEvent of timelineEvents) {
+                  const eventType = String(timelineEvent?.event || '').trim().toLowerCase();
+                  if (eventType && !allowedEventTypes.has(eventType)) {
+                    continue;
+                  }
+
+                  const sourceIssue = timelineEvent?.source?.issue || null;
+                  if (!sourceIssue || sourceIssue?.pull_request) {
+                    continue;
+                  }
+
+                  let sourceRepo = '';
+                  const repositoryUrl = String(sourceIssue?.repository_url || '').trim();
+                  const repoMatch = /\/repos\/([^/]+\/[^/]+)$/.exec(repositoryUrl);
+                  if (repoMatch && repoMatch[1]) {
+                    sourceRepo = String(repoMatch[1]).toLowerCase();
+                  }
+                  if (sourceRepo && sourceRepo !== currentRepo) {
+                    continue;
+                  }
+
+                  appendFallbackIssue(sourceIssue?.number);
+                }
+              } catch (error) {
+                core.warning(`Unable to resolve PR-linked issue timeline references: ${error?.message || String(error)}`);
               }
             }
 
@@ -422,6 +487,10 @@ jobs:
               'fallback_issue_number',
               fallbackIssueNumber > 0 ? String(fallbackIssueNumber) : '',
             );
+            core.setOutput(
+              'fallback_issue_numbers_json',
+              JSON.stringify(fallbackIssueCandidates),
+            );
 
       - name: Build signed bridge payload
         if: ${{ steps.context.outputs.should_notify == 'true' }}
@@ -445,6 +514,7 @@ jobs:
           FAILED_JOB_NAME: ${{ steps.context.outputs.failed_job_name }}
           FAILED_STEP_NAME: ${{ steps.context.outputs.failed_step_name }}
           FALLBACK_ISSUE_NUMBER: ${{ steps.context.outputs.fallback_issue_number }}
+          FALLBACK_ISSUE_NUMBERS_JSON: ${{ steps.context.outputs.fallback_issue_numbers_json }}
           REQUIRE_EXISTING_THREAD: ${{ inputs.require_existing_thread }}
           PAYLOAD_FILE: ${{ runner.temp }}/discord-check-bridge-payload.json
           SIGNATURE_FILE: ${{ runner.temp }}/discord-check-bridge-signature.txt
@@ -500,6 +570,22 @@ jobs:
           run_url = f"https://github.com/{os.environ.get('GITHUB_REPOSITORY', '')}/actions/runs/{run_id}"
 
           primary_url = (os.environ.get("PRIMARY_URL", "") or "").strip() or run_url
+          fallback_issue_numbers = []
+          raw_fallback_issue_numbers = os.environ.get("FALLBACK_ISSUE_NUMBERS_JSON", "").strip()
+          if raw_fallback_issue_numbers:
+            try:
+              parsed = json.loads(raw_fallback_issue_numbers)
+              if isinstance(parsed, list):
+                fallback_issue_numbers = []
+                seen_fallback_issues = set()
+                for item in parsed:
+                  parsed_number = as_int(str(item))
+                  if not parsed_number or parsed_number in seen_fallback_issues:
+                    continue
+                  seen_fallback_issues.add(parsed_number)
+                  fallback_issue_numbers.append(parsed_number)
+            except Exception:
+              fallback_issue_numbers = []
 
           payload = {
             "version": "codex-discord-bridge-v1",
@@ -524,6 +610,7 @@ jobs:
             "run_id": run_id,
             "run_attempt": run_attempt,
             "fallback_issue_number": as_int(os.environ.get("FALLBACK_ISSUE_NUMBER", "")),
+            "fallback_issue_numbers": fallback_issue_numbers,
             "workflow_name": os.environ.get("WORKFLOW_NAME", ""),
             "workflow_result": os.environ.get("WORKFLOW_RESULT", ""),
             "failed_job_name": os.environ.get("FAILED_JOB_NAME", ""),
