@@ -1747,6 +1747,7 @@ jobs:
             }
             core.setOutput('job_url', jobUrl);
             core.setOutput('discord_preview', '');
+            core.setOutput('discord_output', '');
 
             const formatDuration = (totalSeconds) => {
               if (!Number.isFinite(totalSeconds) || totalSeconds < 0) {
@@ -1925,6 +1926,9 @@ jobs:
             const body = visibleOutput
               ? `[run](${jobUrl})\n\n${visibleOutput}`
               : `[run](${jobUrl})\n\n(No public output from ${assistantName}.)`;
+            if (visibleOutput) {
+              core.setOutput('discord_output', visibleOutput);
+            }
             const discordPreview = toDiscordPreview(visibleOutput, 140);
             if (discordPreview) {
               core.setOutput('discord_preview', discordPreview);
@@ -2049,7 +2053,7 @@ jobs:
           DISCORD_CHANNEL_ID: ${{ steps.discord_channel.outputs.channel_id }}
           COMMENT_URL: ${{ steps.post_response.outputs.comment_url }}
           JOB_URL: ${{ steps.post_response.outputs.job_url }}
-          DISCORD_PREVIEW: ${{ steps.post_response.outputs.discord_preview }}
+          DISCORD_OUTPUT: ${{ steps.post_response.outputs.discord_output }}
           JOB_STATUS: ${{ job.status }}
           CODEX_STEP_OUTCOME: ${{ steps.codex.outcome }}
           PAYLOAD_FILE: ${{ runner.temp }}/discord-bridge-payload.json
@@ -2122,7 +2126,7 @@ jobs:
             "discord_channel_id": os.environ.get("DISCORD_CHANNEL_ID", ""),
             "comment_url": os.environ.get("COMMENT_URL", ""),
             "job_url": os.environ.get("JOB_URL", ""),
-            "preview": os.environ.get("DISCORD_PREVIEW", ""),
+            "response_text": os.environ.get("DISCORD_OUTPUT", ""),
             "job_status": os.environ.get("JOB_STATUS", ""),
             "codex_outcome": os.environ.get("CODEX_STEP_OUTCOME", ""),
             "run_id": os.environ.get("GITHUB_RUN_ID", ""),

@@ -42,6 +42,22 @@ test("codex-shared workflow supports signed Discord bridge delivery", () => {
     "Expected bridge event payload generation to read the resolved Discord channel ID.",
   );
   assert.ok(
+    workflow.includes("core.setOutput('discord_output', '');"),
+    "Expected post_response to initialize discord_output for bridge delivery.",
+  );
+  assert.ok(
+    workflow.includes("core.setOutput('discord_output', visibleOutput);"),
+    "Expected post_response to expose full visible output for bridge delivery.",
+  );
+  assert.ok(
+    workflow.includes("DISCORD_OUTPUT: ${{ steps.post_response.outputs.discord_output }}"),
+    "Expected bridge payload generation to use full discord_output content.",
+  );
+  assert.ok(
+    workflow.includes('"response_text": os.environ.get("DISCORD_OUTPUT", "")'),
+    "Expected bridge payload to include response_text from full discord_output.",
+  );
+  assert.ok(
     workflow.includes('"thread_title": thread_title'),
     "Expected bridge payload to include thread_title for Discord thread starter formatting.",
   );
