@@ -1,0 +1,345 @@
+name: Discord Thread State Shared
+
+on:
+  workflow_call:
+    inputs:
+      discord_bridge_url:
+        description: "Signed bridge endpoint URL"
+        required: true
+        type: string
+      runner_group:
+        description: "Runner group for notification job"
+        required: false
+        type: string
+        default: "ci-prod"
+      discord_channel_map:
+        description: "Optional newline-separated GitHub login to Discord channel map"
+        required: false
+        type: string
+        default: ""
+      trigger_login:
+        description: "Preferred GitHub login for channel preference"
+        required: false
+        type: string
+        default: ""
+      issue_number:
+        description: "Issue/PR number"
+        required: true
+        type: number
+      issue_type:
+        description: "issue or pull_request"
+        required: true
+        type: string
+      thread_title:
+        description: "Issue/PR title"
+        required: false
+        type: string
+        default: ""
+      thread_url:
+        description: "Issue/PR URL"
+        required: false
+        type: string
+        default: ""
+      thread_state:
+        description: "open | closed | merged"
+        required: true
+        type: string
+      require_existing_thread:
+        description: "When true, bridge only updates existing thread"
+        required: false
+        type: boolean
+        default: true
+      assistant_name:
+        description: "Assistant display name in payload"
+        required: false
+        type: string
+        default: "Thread"
+      assistant_slug:
+        description: "Assistant slug in payload"
+        required: false
+        type: string
+        default: "thread"
+    secrets:
+      GH_WEBHOOK_SECRET:
+        required: true
+      DISCORD_CHANNEL_MAP:
+        required: false
+
+jobs:
+  notify:
+    runs-on:
+      group: ci-prod
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+    steps:
+      - name: Build thread state context
+        id: context
+        uses: actions/github-script@v7
+        env:
+          INPUT_DISCORD_CHANNEL_MAP: ${{ inputs.discord_channel_map }}
+          SECRET_DISCORD_CHANNEL_MAP: ${{ secrets.DISCORD_CHANNEL_MAP }}
+          INPUT_TRIGGER_LOGIN: ${{ inputs.trigger_login }}
+          INPUT_ISSUE_NUMBER: ${{ inputs.issue_number }}
+          INPUT_ISSUE_TYPE: ${{ inputs.issue_type }}
+          INPUT_THREAD_TITLE: ${{ inputs.thread_title }}
+          INPUT_THREAD_URL: ${{ inputs.thread_url }}
+          INPUT_THREAD_STATE: ${{ inputs.thread_state }}
+        with:
+          script: |
+            const normalizeLogin = (value) =>
+              String(value || '')
+                .trim()
+                .replace(/^@/, '')
+                .toLowerCase();
+
+            const parseChannelMap = (raw) => {
+              const normalized = String(raw || '').trim();
+              if (!normalized) {
+                return {};
+              }
+
+              const appendEntry = (target, key, value) => {
+                const login = normalizeLogin(key);
+                const channelId = String(value || '').trim();
+                if (!login || !channelId) {
+                  return;
+                }
+                target[login] = channelId;
+              };
+
+              if (normalized.startsWith('{')) {
+                try {
+                  const parsed = JSON.parse(normalized);
+                  if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+                    const mapped = {};
+                    for (const [key, value] of Object.entries(parsed)) {
+                      appendEntry(mapped, key, value);
+                    }
+                    return mapped;
+                  }
+                  core.warning('Discord channel map JSON must be an object; ignoring payload.');
+                  return {};
+                } catch (error) {
+                  core.warning(`Unable to parse Discord channel map JSON: ${error.message}`);
+                }
+              }
+
+              const mapped = {};
+              const lines = normalized.split(/\r?\n/);
+              for (let i = 0; i < lines.length; i += 1) {
+                const line = lines[i].trim();
+                if (!line || line.startsWith('#')) {
+                  continue;
+                }
+                const separatorIndex = line.indexOf('=');
+                if (separatorIndex <= 0) {
+                  core.warning(`Ignoring invalid Discord channel map line ${i + 1}; expected login=channel_id.`);
+                  continue;
+                }
+                appendEntry(
+                  mapped,
+                  line.slice(0, separatorIndex),
+                  line.slice(separatorIndex + 1),
+                );
+              }
+
+              return mapped;
+            };
+
+            const unique = (values) => {
+              const seen = new Set();
+              const out = [];
+              for (const value of values) {
+                const normalized = String(value || '').trim();
+                if (!normalized || seen.has(normalized)) {
+                  continue;
+                }
+                seen.add(normalized);
+                out.push(normalized);
+              }
+              return out;
+            };
+
+            const parseIssueNumber = (value) => {
+              const parsed = Number.parseInt(String(value || '').trim(), 10);
+              return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+            };
+
+            const issueNumber = parseIssueNumber(process.env.INPUT_ISSUE_NUMBER);
+            const issueType = String(process.env.INPUT_ISSUE_TYPE || '').trim() || 'issue';
+            const threadTitle = String(process.env.INPUT_THREAD_TITLE || '').trim();
+            const threadUrl = String(process.env.INPUT_THREAD_URL || '').trim();
+            const threadState = String(process.env.INPUT_THREAD_STATE || '').trim().toLowerCase();
+            const triggerLogin = normalizeLogin(process.env.INPUT_TRIGGER_LOGIN || context.actor || '');
+
+            const validThreadState = ['open', 'closed', 'merged'].includes(threadState);
+            if (!issueNumber || !validThreadState) {
+              core.setOutput('should_notify', 'false');
+              core.warning(`Skipping thread state notification: issue_number=${issueNumber}, thread_state=${threadState}`);
+              return;
+            }
+
+            const channelMap = {
+              ...parseChannelMap(process.env.INPUT_DISCORD_CHANNEL_MAP || ''),
+              ...parseChannelMap(process.env.SECRET_DISCORD_CHANNEL_MAP || ''),
+            };
+            const channelCandidates = unique(Object.values(channelMap));
+            const preferredChannelId = triggerLogin ? (channelMap[triggerLogin] || '') : '';
+
+            core.setOutput('should_notify', 'true');
+            core.setOutput('issue_number', String(issueNumber));
+            core.setOutput('issue_type', issueType);
+            core.setOutput('thread_title', threadTitle);
+            core.setOutput('thread_url', threadUrl);
+            core.setOutput('thread_state', threadState);
+            core.setOutput('trigger_login', triggerLogin);
+            core.setOutput('channel_id', preferredChannelId);
+            core.setOutput('channel_candidates_json', JSON.stringify(channelCandidates));
+
+      - name: Build signed bridge payload
+        if: ${{ steps.context.outputs.should_notify == 'true' }}
+        shell: bash
+        env:
+          BRIDGE_SHARED_SECRET: ${{ secrets.GH_WEBHOOK_SECRET }}
+          ASSISTANT_NAME: ${{ inputs.assistant_name }}
+          ASSISTANT_SLUG: ${{ inputs.assistant_slug }}
+          TRIGGER_LOGIN: ${{ steps.context.outputs.trigger_login }}
+          ISSUE_NUMBER: ${{ steps.context.outputs.issue_number }}
+          ISSUE_TYPE: ${{ steps.context.outputs.issue_type }}
+          THREAD_TITLE: ${{ steps.context.outputs.thread_title }}
+          THREAD_URL: ${{ steps.context.outputs.thread_url }}
+          THREAD_STATE: ${{ steps.context.outputs.thread_state }}
+          DISCORD_CHANNEL_ID: ${{ steps.context.outputs.channel_id }}
+          DISCORD_CHANNEL_CANDIDATES_JSON: ${{ steps.context.outputs.channel_candidates_json }}
+          REQUIRE_EXISTING_THREAD: ${{ inputs.require_existing_thread }}
+          PAYLOAD_FILE: ${{ runner.temp }}/discord-thread-state-payload.json
+          SIGNATURE_FILE: ${{ runner.temp }}/discord-thread-state-signature.txt
+          DELIVERY_FILE: ${{ runner.temp }}/discord-thread-state-delivery.txt
+        run: |
+          set -euo pipefail
+
+          if [ -z "${BRIDGE_SHARED_SECRET:-}" ]; then
+            echo "::warning::GH_WEBHOOK_SECRET is empty; skipping Discord bridge event."
+            exit 0
+          fi
+
+          python3 - <<'PY'
+          import hashlib
+          import hmac
+          import json
+          import os
+          import uuid
+          from datetime import datetime, timezone
+
+          def as_int(value: str):
+            try:
+              parsed = int(str(value or "").strip())
+            except Exception:
+              return None
+            return parsed if parsed > 0 else None
+
+          channel_candidates = []
+          raw_candidates = os.environ.get("DISCORD_CHANNEL_CANDIDATES_JSON", "").strip()
+          if raw_candidates:
+            try:
+              parsed = json.loads(raw_candidates)
+              if isinstance(parsed, list):
+                channel_candidates = [
+                  str(item).strip()
+                  for item in parsed
+                  if str(item).strip()
+                ]
+            except Exception:
+              channel_candidates = []
+
+          require_existing_thread = (
+            str(os.environ.get("REQUIRE_EXISTING_THREAD", "")).strip().lower()
+            in {"1", "true", "yes"}
+          )
+
+          payload = {
+            "version": "codex-discord-bridge-v1",
+            "event_kind": "thread_state_update",
+            "repository": os.environ.get("GITHUB_REPOSITORY", ""),
+            "assistant_name": os.environ.get("ASSISTANT_NAME", "Thread"),
+            "assistant_slug": os.environ.get("ASSISTANT_SLUG", "thread"),
+            "trigger_login": os.environ.get("TRIGGER_LOGIN", ""),
+            "issue_number": as_int(os.environ.get("ISSUE_NUMBER", "")),
+            "issue_type": os.environ.get("ISSUE_TYPE", "issue"),
+            "thread_title": os.environ.get("THREAD_TITLE", ""),
+            "thread_url": os.environ.get("THREAD_URL", ""),
+            "thread_state": os.environ.get("THREAD_STATE", ""),
+            "discord_channel_id": os.environ.get("DISCORD_CHANNEL_ID", ""),
+            "discord_channel_candidates": channel_candidates,
+            "require_existing_thread": require_existing_thread,
+            "comment_url": "",
+            "job_url": "",
+            "response_text": "",
+            "job_status": "success",
+            "codex_outcome": "success",
+            "run_id": os.environ.get("GITHUB_RUN_ID", ""),
+            "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT", ""),
+            "sent_at": datetime.now(timezone.utc).isoformat(),
+          }
+
+          serialized = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+          secret = os.environ.get("BRIDGE_SHARED_SECRET", "")
+          signature = "sha256=" + hmac.new(
+            secret.encode("utf-8"),
+            serialized.encode("utf-8"),
+            hashlib.sha256,
+          ).hexdigest()
+          delivery_id = str(uuid.uuid4())
+
+          with open(os.environ["PAYLOAD_FILE"], "w", encoding="utf-8") as handle:
+            handle.write(serialized)
+          with open(os.environ["SIGNATURE_FILE"], "w", encoding="utf-8") as handle:
+            handle.write(signature)
+          with open(os.environ["DELIVERY_FILE"], "w", encoding="utf-8") as handle:
+            handle.write(delivery_id)
+          PY
+
+      - name: Deliver Discord bridge event
+        if: ${{ steps.context.outputs.should_notify == 'true' }}
+        shell: bash
+        env:
+          DISCORD_BRIDGE_URL: ${{ inputs.discord_bridge_url }}
+          PAYLOAD_FILE: ${{ runner.temp }}/discord-thread-state-payload.json
+          SIGNATURE_FILE: ${{ runner.temp }}/discord-thread-state-signature.txt
+          DELIVERY_FILE: ${{ runner.temp }}/discord-thread-state-delivery.txt
+        run: |
+          set -euo pipefail
+
+          if [ -z "${DISCORD_BRIDGE_URL:-}" ]; then
+            echo "Discord bridge URL is empty; skipping bridge event."
+            exit 0
+          fi
+
+          if [ ! -s "${PAYLOAD_FILE}" ] || [ ! -s "${SIGNATURE_FILE}" ] || [ ! -s "${DELIVERY_FILE}" ]; then
+            echo "::warning::Discord bridge payload/signature files missing; skipping delivery."
+            exit 0
+          fi
+
+          signature="$(cat "${SIGNATURE_FILE}")"
+          delivery_id="$(cat "${DELIVERY_FILE}")"
+
+          set +e
+          curl_output="$(
+            curl --fail --silent --show-error \
+              --retry 3 \
+              --retry-delay 1 \
+              -H "Content-Type: application/json" \
+              -H "X-Hub-Signature-256: ${signature}" \
+              -H "X-GitHub-Event: codex.bridge" \
+              -H "X-GitHub-Delivery: ${delivery_id}" \
+              --data-binary @"${PAYLOAD_FILE}" \
+              "${DISCORD_BRIDGE_URL}" 2>&1
+          )"
+          curl_status="$?"
+          set -e
+
+          if [ "${curl_status}" -ne 0 ]; then
+            echo "::warning::Discord bridge delivery failed (exit ${curl_status}): ${curl_output}"
+          fi
