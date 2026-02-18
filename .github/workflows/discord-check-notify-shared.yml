@@ -193,6 +193,31 @@ jobs:
               return 0;
             };
 
+            const parseIssueReferencesFromBody = ({ body, repositoryFullName }) => {
+              const normalizedRepo = String(repositoryFullName || '').trim().toLowerCase();
+              const text = String(body || '');
+              const results = [];
+              const seen = new Set();
+              const pattern = /(?:([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)#|#)(\d+)\b/g;
+              let match;
+              while ((match = pattern.exec(text)) !== null) {
+                const referencedRepo = String(match[1] || '').trim().toLowerCase();
+                if (referencedRepo && referencedRepo !== normalizedRepo) {
+                  continue;
+                }
+                const issueNumber = Number.parseInt(String(match[2] || ''), 10);
+                if (!Number.isFinite(issueNumber) || issueNumber <= 0) {
+                  continue;
+                }
+                if (seen.has(issueNumber)) {
+                  continue;
+                }
+                seen.add(issueNumber);
+                results.push(issueNumber);
+              }
+              return results;
+            };
+
             const upstreamResult = String(process.env.INPUT_UPSTREAM_RESULT || '')
               .trim()
               .toLowerCase();
@@ -222,6 +247,82 @@ jobs:
             };
             const candidateChannelIds = unique(Object.values(channelMap));
             const preferredChannelId = triggerLogin ? (channelMap[triggerLogin] || '') : '';
+
+            const fallbackIssueCandidates = [];
+            const fallbackSeen = new Set();
+            const appendFallbackIssue = (value) => {
+              const number = Number.parseInt(String(value || '').trim(), 10);
+              if (!Number.isFinite(number) || number <= 0 || number === issueNumber) {
+                return;
+              }
+              if (fallbackSeen.has(number)) {
+                return;
+              }
+              fallbackSeen.add(number);
+              fallbackIssueCandidates.push(number);
+            };
+
+            if (issueType === 'pull_request' && issueNumber > 0) {
+              try {
+                const response = await github.graphql(
+                  `
+                    query PullRequestClosingIssues($owner: String!, $repo: String!, $number: Int!) {
+                      repository(owner: $owner, name: $repo) {
+                        pullRequest(number: $number) {
+                          closingIssuesReferences(first: 20) {
+                            nodes {
+                              number
+                              repository {
+                                nameWithOwner
+                              }
+                            }
+                          }
+                          body
+                        }
+                      }
+                    }
+                  `,
+                  {
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    number: issueNumber,
+                  },
+                );
+                const pullRequestNode = response?.repository?.pullRequest || null;
+                const linkedIssues = Array.isArray(pullRequestNode?.closingIssuesReferences?.nodes)
+                  ? pullRequestNode.closingIssuesReferences.nodes
+                  : [];
+                for (const linkedIssue of linkedIssues) {
+                  const linkedRepo = String(linkedIssue?.repository?.nameWithOwner || '').trim().toLowerCase();
+                  const currentRepo = `${context.repo.owner}/${context.repo.repo}`.toLowerCase();
+                  if (linkedRepo && linkedRepo !== currentRepo) {
+                    continue;
+                  }
+                  appendFallbackIssue(linkedIssue?.number);
+                }
+
+                const bodyIssueRefs = parseIssueReferencesFromBody({
+                  body: pullRequestNode?.body || pullRequest?.body || '',
+                  repositoryFullName: `${context.repo.owner}/${context.repo.repo}`,
+                });
+                for (const referencedIssueNumber of bodyIssueRefs) {
+                  appendFallbackIssue(referencedIssueNumber);
+                }
+              } catch (error) {
+                core.warning(`Unable to resolve PR-linked issues for fallback thread routing: ${error.message}`);
+                const bodyIssueRefs = parseIssueReferencesFromBody({
+                  body: pullRequest?.body || '',
+                  repositoryFullName: `${context.repo.owner}/${context.repo.repo}`,
+                });
+                for (const referencedIssueNumber of bodyIssueRefs) {
+                  appendFallbackIssue(referencedIssueNumber);
+                }
+              }
+            }
+
+            const fallbackIssueNumber = fallbackIssueCandidates.length > 0
+              ? fallbackIssueCandidates[0]
+              : 0;
 
             const iconMap = {
               success: '✅',
@@ -285,6 +386,10 @@ jobs:
             core.setOutput('workflow_name', workflowName);
             core.setOutput('failed_job_name', failedJobName);
             core.setOutput('failed_step_name', failedStepName);
+            core.setOutput(
+              'fallback_issue_number',
+              fallbackIssueNumber > 0 ? String(fallbackIssueNumber) : '',
+            );
 
       - name: Build signed bridge payload
         if: ${{ steps.context.outputs.should_notify == 'true' }}
@@ -305,6 +410,7 @@ jobs:
           WORKFLOW_RESULT: ${{ steps.context.outputs.upstream_result }}
           FAILED_JOB_NAME: ${{ steps.context.outputs.failed_job_name }}
           FAILED_STEP_NAME: ${{ steps.context.outputs.failed_step_name }}
+          FALLBACK_ISSUE_NUMBER: ${{ steps.context.outputs.fallback_issue_number }}
           REQUIRE_EXISTING_THREAD: ${{ inputs.require_existing_thread }}
           PAYLOAD_FILE: ${{ runner.temp }}/discord-check-bridge-payload.json
           SIGNATURE_FILE: ${{ runner.temp }}/discord-check-bridge-signature.txt
@@ -376,6 +482,7 @@ jobs:
             "codex_outcome": os.environ.get("WORKFLOW_RESULT", ""),
             "run_id": run_id,
             "run_attempt": run_attempt,
+            "fallback_issue_number": as_int(os.environ.get("FALLBACK_ISSUE_NUMBER", "")),
             "workflow_name": os.environ.get("WORKFLOW_NAME", ""),
             "workflow_result": os.environ.get("WORKFLOW_RESULT", ""),
             "failed_job_name": os.environ.get("FAILED_JOB_NAME", ""),
