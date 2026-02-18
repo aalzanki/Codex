@@ -9,6 +9,10 @@ inputs:
     discord_bridge_url:
         description: Signed bridge endpoint URL
         required: true
+    discord_thread_id:
+        description: Optional Discord thread ID to post updates into directly
+        required: false
+        default: ''
     discord_channel_map:
         description: Optional newline-separated GitHub login to Discord channel map
         required: false
@@ -60,6 +64,11 @@ inputs:
         description: Assistant slug in bridge payload
         required: false
         default: checks
+
+outputs:
+    destination_channel_id:
+        description: Destination Discord thread/channel ID resolved by the bridge
+        value: ${{ steps.deliver.outputs.destination_channel_id }}
 
 runs:
     using: composite
@@ -475,6 +484,7 @@ runs:
               THREAD_URL: ${{ steps.context.outputs.thread_url }}
               PRIMARY_URL: ${{ steps.context.outputs.primary_url }}
               DISCORD_CHANNEL_ID: ${{ steps.context.outputs.channel_id }}
+              DISCORD_THREAD_ID: ${{ inputs.discord_thread_id }}
               DISCORD_CHANNEL_CANDIDATES_JSON: ${{ steps.context.outputs.channel_candidates_json }}
               RESPONSE_TEXT: ${{ steps.context.outputs.response_text }}
               SUPPRESS_NOTIFICATIONS: ${{ inputs.suppress_notifications }}
@@ -568,6 +578,7 @@ runs:
                 "thread_title": os.environ.get("THREAD_TITLE", ""),
                 "thread_url": os.environ.get("THREAD_URL", ""),
                 "discord_channel_id": os.environ.get("DISCORD_CHANNEL_ID", ""),
+                "discord_thread_id": os.environ.get("DISCORD_THREAD_ID", ""),
                 "discord_channel_candidates": channel_candidates,
                 "require_existing_thread": require_existing_thread,
                 "suppress_notifications": suppress_notifications,
@@ -605,10 +616,12 @@ runs:
               PY
 
         - name: Deliver Discord bridge event
+          id: deliver
           if: ${{ steps.context.outputs.should_notify == 'true' }}
           shell: bash
           env:
               DISCORD_BRIDGE_URL: ${{ inputs.discord_bridge_url }}
+              INPUT_DISCORD_THREAD_ID: ${{ inputs.discord_thread_id }}
               PAYLOAD_FILE: ${{ runner.temp }}/discord-check-bridge-payload.json
               SIGNATURE_FILE: ${{ runner.temp }}/discord-check-bridge-signature.txt
               DELIVERY_FILE: ${{ runner.temp }}/discord-check-bridge-delivery.txt
@@ -661,3 +674,15 @@ runs:
                 echo "::warning::Discord bridge delivery failed (HTTP ${http_code}): ${response_body}"
                 exit 0
               fi
+
+              resolved_destination="${INPUT_DISCORD_THREAD_ID:-}"
+              if [ -s "${RESPONSE_FILE}" ]; then
+                parsed_destination="$(
+                  node -e "const fs=require('fs'); try { const p=JSON.parse(fs.readFileSync(process.env.RESPONSE_FILE,'utf8')); const v=String((p && p.destination_channel_id) || '').trim(); if (v) process.stdout.write(v); } catch {}"
+                )"
+                if [ -n "${parsed_destination}" ]; then
+                  resolved_destination="${parsed_destination}"
+                fi
+              fi
+
+              echo "destination_channel_id=${resolved_destination}" >> "$GITHUB_OUTPUT"
