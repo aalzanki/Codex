@@ -1464,6 +1464,263 @@ jobs:
             core.setOutput('job_url', jobUrl);
             core.setOutput('started_at_epoch', String(Math.floor(Date.now() / 1000)));
 
+      - name: Resolve Discord channel for trigger user (prompt mirror)
+        id: discord_channel_prompt
+        if: ${{ inputs.discord_bridge_url != '' }}
+        continue-on-error: true
+        uses: actions/github-script@v7
+        env:
+          TRIGGER_LOGIN: ${{ steps.prompt.outputs.trigger_login }}
+          DISCORD_CHANNEL_MAP_INPUT: ${{ inputs.discord_channel_map }}
+          DISCORD_CHANNEL_MAP_SECRET: ${{ secrets.DISCORD_CHANNEL_MAP }}
+        with:
+          script: |
+            const normalizeLogin = (value) =>
+              String(value || '')
+                .trim()
+                .replace(/^@/, '')
+                .toLowerCase();
+
+            const parseChannelMap = (raw) => {
+              const normalized = String(raw || '').trim();
+              if (!normalized) {
+                return {};
+              }
+
+              const appendEntry = (target, key, value) => {
+                const login = normalizeLogin(key);
+                const channelId = String(value || '').trim();
+                if (!login || !channelId) {
+                  return;
+                }
+                target[login] = channelId;
+              };
+
+              if (normalized.startsWith('{')) {
+                try {
+                  const parsed = JSON.parse(normalized);
+                  if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+                    const mapped = {};
+                    for (const [key, value] of Object.entries(parsed)) {
+                      appendEntry(mapped, key, value);
+                    }
+                    return mapped;
+                  }
+                  core.warning('discord_channel_map JSON must be an object; ignoring payload.');
+                  return {};
+                } catch (error) {
+                  core.warning(`Unable to parse discord_channel_map JSON payload: ${error.message}`);
+                }
+              }
+
+              const mapped = {};
+              const lines = normalized.split(/\r?\n/);
+              for (let i = 0; i < lines.length; i += 1) {
+                const line = lines[i].trim();
+                if (!line || line.startsWith('#')) {
+                  continue;
+                }
+                const separatorIndex = line.indexOf('=');
+                if (separatorIndex <= 0) {
+                  core.warning(`Ignoring invalid discord_channel_map line ${i + 1}; expected login=channel_id.`);
+                  continue;
+                }
+                appendEntry(
+                  mapped,
+                  line.slice(0, separatorIndex),
+                  line.slice(separatorIndex + 1)
+                );
+              }
+              return mapped;
+            };
+
+            const channelMap = {
+              ...parseChannelMap(process.env.DISCORD_CHANNEL_MAP_INPUT || ''),
+              ...parseChannelMap(process.env.DISCORD_CHANNEL_MAP_SECRET || ''),
+            };
+
+            const triggerLogin = normalizeLogin(process.env.TRIGGER_LOGIN || '');
+            core.setOutput('trigger_login', triggerLogin);
+            core.setOutput('channel_id', '');
+            core.setOutput('notify_discord', 'false');
+            if (!triggerLogin) {
+              core.info('Trigger login missing; Discord prompt mirror disabled.');
+              return;
+            }
+
+            const channelId = channelMap[triggerLogin] || '';
+            if (!channelId) {
+              core.info(`No Discord channel mapping found for @${triggerLogin}; skipping prompt mirror.`);
+              return;
+            }
+
+            const isSnowflake = /^[0-9]{6,}$/.test(channelId);
+            if (!isSnowflake) {
+              core.warning(`Invalid Discord channel ID mapped for @${triggerLogin}; expected numeric snowflake.`);
+              return;
+            }
+
+            core.setOutput('channel_id', channelId);
+            core.setOutput('notify_discord', 'true');
+            core.info(`Discord channel resolved for @${triggerLogin} (prompt mirror).`);
+
+      - name: Build Discord prompt mirror payload
+        if: ${{ inputs.discord_bridge_url != '' && steps.discord_channel_prompt.outputs.notify_discord == 'true' }}
+        continue-on-error: true
+        shell: bash
+        env:
+          BRIDGE_SHARED_SECRET: ${{ secrets.GH_WEBHOOK_SECRET }}
+          TRIGGER_LOGIN: ${{ steps.prompt.outputs.trigger_login }}
+          DISCORD_CHANNEL_ID: ${{ steps.discord_channel_prompt.outputs.channel_id }}
+          PAYLOAD_FILE: ${{ runner.temp }}/discord-prompt-bridge-payload.json
+          SIGNATURE_FILE: ${{ runner.temp }}/discord-prompt-bridge-signature.txt
+          DELIVERY_FILE: ${{ runner.temp }}/discord-prompt-bridge-delivery.txt
+        run: |
+          set -euo pipefail
+
+          if [ -z "${BRIDGE_SHARED_SECRET:-}" ]; then
+            echo "::warning::GH_WEBHOOK_SECRET is empty; skipping Discord prompt mirror."
+            exit 0
+          fi
+
+          python3 - <<'PY'
+          import hashlib
+          import hmac
+          import json
+          import os
+          import uuid
+          from datetime import datetime, timezone
+
+          event_name = os.environ.get("GITHUB_EVENT_NAME", "")
+          event_path = os.environ.get("GITHUB_EVENT_PATH", "")
+
+          issue_number = None
+          issue_type = "unknown"
+          thread_title = ""
+          thread_url = ""
+          source_text = ""
+          comment_url = ""
+
+          if event_path:
+            try:
+              with open(event_path, "r", encoding="utf-8") as handle:
+                event = json.load(handle)
+
+              if event_name == "issue_comment":
+                issue = event.get("issue", {}) or {}
+                comment = event.get("comment", {}) or {}
+                issue_number = issue.get("number")
+                issue_type = "pull_request" if issue.get("pull_request") else "issue"
+                thread_title = (issue.get("title") or "").strip()
+                thread_url = (issue.get("html_url") or "").strip()
+                source_text = (comment.get("body") or "").strip()
+                comment_url = (comment.get("html_url") or "").strip()
+              elif event_name == "pull_request_review_comment":
+                pull_request = event.get("pull_request", {}) or {}
+                comment = event.get("comment", {}) or {}
+                issue_number = pull_request.get("number")
+                issue_type = "pull_request"
+                thread_title = (pull_request.get("title") or "").strip()
+                thread_url = (pull_request.get("html_url") or "").strip()
+                source_text = (comment.get("body") or "").strip()
+                comment_url = (comment.get("html_url") or "").strip()
+              elif event_name == "pull_request_review":
+                pull_request = event.get("pull_request", {}) or {}
+                review = event.get("review", {}) or {}
+                issue_number = pull_request.get("number")
+                issue_type = "pull_request"
+                thread_title = (pull_request.get("title") or "").strip()
+                thread_url = (pull_request.get("html_url") or "").strip()
+                source_text = (review.get("body") or "").strip()
+                comment_url = (review.get("html_url") or "").strip()
+              elif event_name == "issues":
+                issue = event.get("issue", {}) or {}
+                issue_number = issue.get("number")
+                issue_type = "pull_request" if issue.get("pull_request") else "issue"
+                thread_title = (issue.get("title") or "").strip()
+                thread_url = (issue.get("html_url") or "").strip()
+                source_text = (issue.get("body") or "").strip() or (issue.get("title") or "").strip()
+                comment_url = (issue.get("html_url") or "").strip()
+            except Exception:
+              issue_number = None
+              issue_type = "unknown"
+              thread_title = ""
+              thread_url = ""
+              source_text = ""
+              comment_url = ""
+
+          if not source_text:
+            raise SystemExit(0)
+
+          payload = {
+            "version": "codex-discord-bridge-v1",
+            "event_kind": "github_prompt",
+            "repository": os.environ.get("GITHUB_REPOSITORY", ""),
+            "assistant_name": "GitHub",
+            "assistant_slug": "github",
+            "trigger_login": os.environ.get("TRIGGER_LOGIN", ""),
+            "issue_number": issue_number,
+            "issue_type": issue_type,
+            "thread_title": thread_title,
+            "thread_url": thread_url,
+            "discord_channel_id": os.environ.get("DISCORD_CHANNEL_ID", ""),
+            "comment_url": comment_url,
+            "job_url": f"{os.environ.get('GITHUB_SERVER_URL', '')}/{os.environ.get('GITHUB_REPOSITORY', '')}/actions/runs/{os.environ.get('GITHUB_RUN_ID', '')}",
+            "response_text": source_text,
+            "run_id": os.environ.get("GITHUB_RUN_ID", ""),
+            "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT", ""),
+            "suppress_notifications": True,
+            "require_existing_thread": False,
+            "sent_at": datetime.now(timezone.utc).isoformat(),
+          }
+
+          serialized = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+          secret = os.environ.get("BRIDGE_SHARED_SECRET", "")
+          signature = "sha256=" + hmac.new(
+            secret.encode("utf-8"),
+            serialized.encode("utf-8"),
+            hashlib.sha256,
+          ).hexdigest()
+          delivery_id = str(uuid.uuid4())
+
+          with open(os.environ["PAYLOAD_FILE"], "w", encoding="utf-8") as handle:
+            handle.write(serialized)
+          with open(os.environ["SIGNATURE_FILE"], "w", encoding="utf-8") as handle:
+            handle.write(signature)
+          with open(os.environ["DELIVERY_FILE"], "w", encoding="utf-8") as handle:
+            handle.write(delivery_id)
+          PY
+
+      - name: Deliver Discord prompt mirror event
+        if: ${{ inputs.discord_bridge_url != '' && steps.discord_channel_prompt.outputs.notify_discord == 'true' }}
+        continue-on-error: true
+        shell: bash
+        env:
+          DISCORD_BRIDGE_URL: ${{ inputs.discord_bridge_url }}
+          PAYLOAD_FILE: ${{ runner.temp }}/discord-prompt-bridge-payload.json
+          SIGNATURE_FILE: ${{ runner.temp }}/discord-prompt-bridge-signature.txt
+          DELIVERY_FILE: ${{ runner.temp }}/discord-prompt-bridge-delivery.txt
+        run: |
+          set -euo pipefail
+
+          if [ ! -s "${PAYLOAD_FILE}" ] || [ ! -s "${SIGNATURE_FILE}" ] || [ ! -s "${DELIVERY_FILE}" ]; then
+            echo "Discord prompt mirror payload missing; skipping delivery."
+            exit 0
+          fi
+
+          signature="$(cat "${SIGNATURE_FILE}")"
+          delivery_id="$(cat "${DELIVERY_FILE}")"
+
+          curl --fail --silent --show-error \
+            --retry 3 \
+            --retry-delay 1 \
+            -H "Content-Type: application/json" \
+            -H "X-Hub-Signature-256: ${signature}" \
+            -H "X-GitHub-Event: codex.bridge" \
+            -H "X-GitHub-Delivery: ${delivery_id}" \
+            --data-binary @"${PAYLOAD_FILE}" \
+            "${DISCORD_BRIDGE_URL}"
+
       - name: Run Codex
         id: codex
         env:
