@@ -268,60 +268,71 @@ jobs:
             };
 
             if (issueType === 'pull_request' && issueNumber > 0) {
-              try {
-                const response = await github.graphql(
-                  `
-                    query PullRequestClosingIssues($owner: String!, $repo: String!, $number: Int!) {
-                      repository(owner: $owner, name: $repo) {
-                        pullRequest(number: $number) {
-                          closingIssuesReferences(first: 20) {
-                            nodes {
-                              number
-                              repository {
-                                nameWithOwner
+              let pullRequestBodyForParsing = pullRequest?.body || '';
+              let graphQlResolved = false;
+              let graphQlErrorMessage = '';
+
+              for (let attempt = 1; attempt <= 3; attempt += 1) {
+                try {
+                  const response = await github.graphql(
+                    `
+                      query PullRequestClosingIssues($owner: String!, $repo: String!, $number: Int!) {
+                        repository(owner: $owner, name: $repo) {
+                          pullRequest(number: $number) {
+                            closingIssuesReferences(first: 20) {
+                              nodes {
+                                number
+                                repository {
+                                  nameWithOwner
+                                }
                               }
                             }
+                            body
                           }
-                          body
                         }
                       }
-                    }
-                  `,
-                  {
-                    owner: context.repo.owner,
-                    repo: context.repo.repo,
-                    number: issueNumber,
-                  },
-                );
-                const pullRequestNode = response?.repository?.pullRequest || null;
-                const linkedIssues = Array.isArray(pullRequestNode?.closingIssuesReferences?.nodes)
-                  ? pullRequestNode.closingIssuesReferences.nodes
-                  : [];
-                for (const linkedIssue of linkedIssues) {
-                  const linkedRepo = String(linkedIssue?.repository?.nameWithOwner || '').trim().toLowerCase();
-                  const currentRepo = `${context.repo.owner}/${context.repo.repo}`.toLowerCase();
-                  if (linkedRepo && linkedRepo !== currentRepo) {
-                    continue;
-                  }
-                  appendFallbackIssue(linkedIssue?.number);
-                }
+                    `,
+                    {
+                      owner: context.repo.owner,
+                      repo: context.repo.repo,
+                      number: issueNumber,
+                    },
+                  );
 
-                const bodyIssueRefs = parseIssueReferencesFromBody({
-                  body: pullRequestNode?.body || pullRequest?.body || '',
-                  repositoryFullName: `${context.repo.owner}/${context.repo.repo}`,
-                });
-                for (const referencedIssueNumber of bodyIssueRefs) {
-                  appendFallbackIssue(referencedIssueNumber);
+                  const pullRequestNode = response?.repository?.pullRequest || null;
+                  const linkedIssues = Array.isArray(pullRequestNode?.closingIssuesReferences?.nodes)
+                    ? pullRequestNode.closingIssuesReferences.nodes
+                    : [];
+                  for (const linkedIssue of linkedIssues) {
+                    const linkedRepo = String(linkedIssue?.repository?.nameWithOwner || '').trim().toLowerCase();
+                    const currentRepo = `${context.repo.owner}/${context.repo.repo}`.toLowerCase();
+                    if (linkedRepo && linkedRepo !== currentRepo) {
+                      continue;
+                    }
+                    appendFallbackIssue(linkedIssue?.number);
+                  }
+
+                  pullRequestBodyForParsing = pullRequestNode?.body || pullRequest?.body || '';
+                  graphQlResolved = true;
+                  break;
+                } catch (error) {
+                  graphQlErrorMessage = error?.message || String(error);
+                  if (attempt < 3) {
+                    await new Promise((resolve) => setTimeout(resolve, attempt * 250));
+                  }
                 }
-              } catch (error) {
-                core.warning(`Unable to resolve PR-linked issues for fallback thread routing: ${error.message}`);
-                const bodyIssueRefs = parseIssueReferencesFromBody({
-                  body: pullRequest?.body || '',
-                  repositoryFullName: `${context.repo.owner}/${context.repo.repo}`,
-                });
-                for (const referencedIssueNumber of bodyIssueRefs) {
-                  appendFallbackIssue(referencedIssueNumber);
-                }
+              }
+
+              if (!graphQlResolved && graphQlErrorMessage) {
+                core.warning(`Unable to resolve PR-linked issues for fallback thread routing: ${graphQlErrorMessage}`);
+              }
+
+              const bodyIssueRefs = parseIssueReferencesFromBody({
+                body: pullRequestBodyForParsing || pullRequest?.body || '',
+                repositoryFullName: `${context.repo.owner}/${context.repo.repo}`,
+              });
+              for (const referencedIssueNumber of bodyIssueRefs) {
+                appendFallbackIssue(referencedIssueNumber);
               }
             }
 
