@@ -264,118 +264,122 @@ runs:
                   };
 
                   if (issueType === 'pull_request' && issueNumber > 0) {
+                    const lightweightFallbackOnly = upstreamResult === 'started';
                     let pullRequestBodyForParsing = pullRequest?.body || '';
-                    let graphQlResolved = false;
-                    let graphQlErrorMessage = '';
 
-                    for (let attempt = 1; attempt <= 3; attempt += 1) {
-                      try {
-                        const response = await github.graphql(
-                          `
-                            query PullRequestClosingIssues($owner: String!, $repo: String!, $number: Int!) {
-                              repository(owner: $owner, name: $repo) {
-                                pullRequest(number: $number) {
-                                  closingIssuesReferences(first: 20) {
-                                    nodes {
-                                      number
-                                      repository {
-                                        nameWithOwner
+                    const appendTextIssueRefs = (text) => {
+                      const references = parseIssueReferencesFromText({
+                        text,
+                        repositoryFullName: `${context.repo.owner}/${context.repo.repo}`,
+                      });
+                      for (const referencedIssueNumber of references) {
+                        appendFallbackIssue(referencedIssueNumber);
+                      }
+                    };
+
+                    appendTextIssueRefs(pullRequestBodyForParsing);
+                    appendTextIssueRefs(pullRequest?.title || '');
+
+                    if (lightweightFallbackOnly) {
+                      core.info('Skipping GraphQL/timeline fallback issue resolution for started status to reduce latency.');
+                    } else {
+                      let graphQlResolved = false;
+                      let graphQlErrorMessage = '';
+
+                      for (let attempt = 1; attempt <= 3; attempt += 1) {
+                        try {
+                          const response = await github.graphql(
+                            `
+                              query PullRequestClosingIssues($owner: String!, $repo: String!, $number: Int!) {
+                                repository(owner: $owner, name: $repo) {
+                                  pullRequest(number: $number) {
+                                    closingIssuesReferences(first: 20) {
+                                      nodes {
+                                        number
+                                        repository {
+                                          nameWithOwner
+                                        }
                                       }
                                     }
+                                    body
                                   }
-                                  body
                                 }
                               }
+                            `,
+                            {
+                              owner: context.repo.owner,
+                              repo: context.repo.repo,
+                              number: issueNumber,
+                            },
+                          );
+
+                          const pullRequestNode = response?.repository?.pullRequest || null;
+                          const linkedIssues = Array.isArray(pullRequestNode?.closingIssuesReferences?.nodes)
+                            ? pullRequestNode.closingIssuesReferences.nodes
+                            : [];
+                          for (const linkedIssue of linkedIssues) {
+                            const linkedRepo = String(linkedIssue?.repository?.nameWithOwner || '').trim().toLowerCase();
+                            const currentRepo = `${context.repo.owner}/${context.repo.repo}`.toLowerCase();
+                            if (linkedRepo && linkedRepo !== currentRepo) {
+                              continue;
                             }
-                          `,
+                            appendFallbackIssue(linkedIssue?.number);
+                          }
+
+                          pullRequestBodyForParsing = pullRequestNode?.body || pullRequest?.body || '';
+                          appendTextIssueRefs(pullRequestBodyForParsing);
+                          graphQlResolved = true;
+                          break;
+                        } catch (error) {
+                          graphQlErrorMessage = error?.message || String(error);
+                          if (attempt < 3) {
+                            await new Promise((resolve) => setTimeout(resolve, attempt * 250));
+                          }
+                        }
+                      }
+
+                      if (!graphQlResolved && graphQlErrorMessage) {
+                        core.warning(`Unable to resolve PR-linked issues for fallback thread routing: ${graphQlErrorMessage}`);
+                      }
+
+                      try {
+                        const timelineEvents = await github.paginate(
+                          github.rest.issues.listEventsForTimeline,
                           {
                             owner: context.repo.owner,
                             repo: context.repo.repo,
-                            number: issueNumber,
+                            issue_number: issueNumber,
+                            per_page: 100,
                           },
                         );
-
-                        const pullRequestNode = response?.repository?.pullRequest || null;
-                        const linkedIssues = Array.isArray(pullRequestNode?.closingIssuesReferences?.nodes)
-                          ? pullRequestNode.closingIssuesReferences.nodes
-                          : [];
-                        for (const linkedIssue of linkedIssues) {
-                          const linkedRepo = String(linkedIssue?.repository?.nameWithOwner || '').trim().toLowerCase();
-                          const currentRepo = `${context.repo.owner}/${context.repo.repo}`.toLowerCase();
-                          if (linkedRepo && linkedRepo !== currentRepo) {
+                        const allowedEventTypes = new Set(['cross-referenced', 'connected', 'referenced']);
+                        const currentRepo = `${context.repo.owner}/${context.repo.repo}`.toLowerCase();
+                        for (const timelineEvent of timelineEvents) {
+                          const eventType = String(timelineEvent?.event || '').trim().toLowerCase();
+                          if (eventType && !allowedEventTypes.has(eventType)) {
                             continue;
                           }
-                          appendFallbackIssue(linkedIssue?.number);
-                        }
 
-                        pullRequestBodyForParsing = pullRequestNode?.body || pullRequest?.body || '';
-                        graphQlResolved = true;
-                        break;
+                          const sourceIssue = timelineEvent?.source?.issue || null;
+                          if (!sourceIssue || sourceIssue?.pull_request) {
+                            continue;
+                          }
+
+                          let sourceRepo = '';
+                          const repositoryUrl = String(sourceIssue?.repository_url || '').trim();
+                          const repoMatch = /\/repos\/([^/]+\/[^/]+)$/.exec(repositoryUrl);
+                          if (repoMatch && repoMatch[1]) {
+                            sourceRepo = String(repoMatch[1]).toLowerCase();
+                          }
+                          if (sourceRepo && sourceRepo !== currentRepo) {
+                            continue;
+                          }
+
+                          appendFallbackIssue(sourceIssue?.number);
+                        }
                       } catch (error) {
-                        graphQlErrorMessage = error?.message || String(error);
-                        if (attempt < 3) {
-                          await new Promise((resolve) => setTimeout(resolve, attempt * 250));
-                        }
+                        core.warning(`Unable to resolve PR-linked issue timeline references: ${error?.message || String(error)}`);
                       }
-                    }
-
-                    if (!graphQlResolved && graphQlErrorMessage) {
-                      core.warning(`Unable to resolve PR-linked issues for fallback thread routing: ${graphQlErrorMessage}`);
-                    }
-
-                    const textIssueRefs = parseIssueReferencesFromText({
-                      text: pullRequestBodyForParsing || pullRequest?.body || '',
-                      repositoryFullName: `${context.repo.owner}/${context.repo.repo}`,
-                    });
-                    for (const referencedIssueNumber of textIssueRefs) {
-                      appendFallbackIssue(referencedIssueNumber);
-                    }
-
-                    const titleIssueRefs = parseIssueReferencesFromText({
-                      text: pullRequest?.title || '',
-                      repositoryFullName: `${context.repo.owner}/${context.repo.repo}`,
-                    });
-                    for (const referencedIssueNumber of titleIssueRefs) {
-                      appendFallbackIssue(referencedIssueNumber);
-                    }
-
-                    try {
-                      const timelineEvents = await github.paginate(
-                        github.rest.issues.listEventsForTimeline,
-                        {
-                          owner: context.repo.owner,
-                          repo: context.repo.repo,
-                          issue_number: issueNumber,
-                          per_page: 100,
-                        },
-                      );
-                      const allowedEventTypes = new Set(['cross-referenced', 'connected', 'referenced']);
-                      const currentRepo = `${context.repo.owner}/${context.repo.repo}`.toLowerCase();
-                      for (const timelineEvent of timelineEvents) {
-                        const eventType = String(timelineEvent?.event || '').trim().toLowerCase();
-                        if (eventType && !allowedEventTypes.has(eventType)) {
-                          continue;
-                        }
-
-                        const sourceIssue = timelineEvent?.source?.issue || null;
-                        if (!sourceIssue || sourceIssue?.pull_request) {
-                          continue;
-                        }
-
-                        let sourceRepo = '';
-                        const repositoryUrl = String(sourceIssue?.repository_url || '').trim();
-                        const repoMatch = /\/repos\/([^/]+\/[^/]+)$/.exec(repositoryUrl);
-                        if (repoMatch && repoMatch[1]) {
-                          sourceRepo = String(repoMatch[1]).toLowerCase();
-                        }
-                        if (sourceRepo && sourceRepo !== currentRepo) {
-                          continue;
-                        }
-
-                        appendFallbackIssue(sourceIssue?.number);
-                      }
-                    } catch (error) {
-                      core.warning(`Unable to resolve PR-linked issue timeline references: ${error?.message || String(error)}`);
                     }
                   }
 
