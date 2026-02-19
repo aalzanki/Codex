@@ -1732,6 +1732,8 @@ jobs:
           PAYLOAD_FILE: ${{ runner.temp }}/discord-prompt-bridge-payload.json
           SIGNATURE_FILE: ${{ runner.temp }}/discord-prompt-bridge-signature.txt
           DELIVERY_FILE: ${{ runner.temp }}/discord-prompt-bridge-delivery.txt
+          RESPONSE_FILE: ${{ runner.temp }}/discord-prompt-bridge-response.txt
+          CURL_STDERR_FILE: ${{ runner.temp }}/discord-prompt-bridge-curl-stderr.txt
         run: |
           set -euo pipefail
 
@@ -1743,15 +1745,56 @@ jobs:
           signature="$(cat "${SIGNATURE_FILE}")"
           delivery_id="$(cat "${DELIVERY_FILE}")"
 
-          curl --fail --silent --show-error \
-            --retry 3 \
-            --retry-delay 1 \
-            -H "Content-Type: application/json" \
-            -H "X-Hub-Signature-256: ${signature}" \
-            -H "X-GitHub-Event: codex.bridge" \
-            -H "X-GitHub-Delivery: ${delivery_id}" \
-            --data-binary @"${PAYLOAD_FILE}" \
-            "${DISCORD_BRIDGE_URL}"
+          max_attempts=6
+          attempt=1
+          curl_status=0
+          http_code=""
+          delivered="false"
+
+          while [ "${attempt}" -le "${max_attempts}" ]; do
+            : > "${RESPONSE_FILE}"
+            : > "${CURL_STDERR_FILE}"
+
+            set +e
+            http_code="$(
+              curl --silent --show-error \
+                --connect-timeout 10 \
+                --max-time 60 \
+                --output "${RESPONSE_FILE}" \
+                --write-out "%{http_code}" \
+                -H "Content-Type: application/json" \
+                -H "X-Hub-Signature-256: ${signature}" \
+                -H "X-GitHub-Event: codex.bridge" \
+                -H "X-GitHub-Delivery: ${delivery_id}" \
+                --data-binary @"${PAYLOAD_FILE}" \
+                "${DISCORD_BRIDGE_URL}" 2>"${CURL_STDERR_FILE}"
+            )"
+            curl_status="$?"
+            set -e
+
+            if [ "${curl_status}" -eq 0 ] && [[ "${http_code}" =~ ^[0-9]{3}$ ]] && [ "${http_code}" -ge 200 ] && [ "${http_code}" -lt 300 ]; then
+              delivered="true"
+              break
+            fi
+
+            if [ "${attempt}" -lt "${max_attempts}" ]; then
+              sleep_seconds="$((attempt * 2))"
+              echo "::notice::Discord prompt mirror delivery retry ${attempt}/${max_attempts} (curl=${curl_status}, http=${http_code:-n/a}) in ${sleep_seconds}s."
+              sleep "${sleep_seconds}"
+            fi
+
+            attempt=$((attempt + 1))
+          done
+
+          if [ "${delivered}" != "true" ]; then
+            curl_output="$(cat "${CURL_STDERR_FILE}" 2>/dev/null || true)"
+            response_body="$(cat "${RESPONSE_FILE}" 2>/dev/null || true)"
+            if [ -z "${response_body}" ]; then
+              response_body="<empty response body>"
+            fi
+            echo "::warning::Discord prompt mirror delivery failed after ${max_attempts} attempts (curl=${curl_status}, http=${http_code:-n/a}, stderr=${curl_output}, body=${response_body})"
+            exit 0
+          fi
 
       - name: Run Codex
         id: codex
@@ -2325,14 +2368,27 @@ jobs:
             core.setOutput('channel_id', '');
             core.setOutput('channel_candidates_json', JSON.stringify(channelCandidates));
             core.setOutput('notify_discord', 'false');
+            core.setOutput('require_existing_thread', 'false');
             if (!triggerLogin) {
-              core.info('Trigger login missing; Discord bridge notification disabled.');
+              if (channelCandidates.length > 0) {
+                core.setOutput('notify_discord', 'true');
+                core.setOutput('require_existing_thread', 'true');
+                core.info('Trigger login missing; using existing-thread delivery fallback across channel candidates.');
+              } else {
+                core.info('Trigger login missing; Discord bridge notification disabled.');
+              }
               return;
             }
 
             const channelId = channelMap[triggerLogin] || '';
             if (!channelId) {
-              core.info(`No Discord channel mapping found for @${triggerLogin}; skipping bridge notification.`);
+              if (channelCandidates.length > 0) {
+                core.setOutput('notify_discord', 'true');
+                core.setOutput('require_existing_thread', 'true');
+                core.info(`No direct Discord channel mapping found for @${triggerLogin}; attempting existing-thread delivery across channel candidates.`);
+              } else {
+                core.info(`No Discord channel mapping found for @${triggerLogin}; skipping bridge notification.`);
+              }
               return;
             }
 
@@ -2344,6 +2400,7 @@ jobs:
 
             core.setOutput('channel_id', channelId);
             core.setOutput('notify_discord', 'true');
+            core.setOutput('require_existing_thread', 'false');
             core.info(`Discord channel resolved for @${triggerLogin}.`);
 
       - name: Post Discord bridge event
@@ -2357,6 +2414,7 @@ jobs:
           TRIGGER_LOGIN: ${{ steps.prompt.outputs.trigger_login }}
           DISCORD_CHANNEL_ID: ${{ steps.discord_channel.outputs.channel_id }}
           DISCORD_CHANNEL_CANDIDATES_JSON: ${{ steps.discord_channel.outputs.channel_candidates_json }}
+          REQUIRE_EXISTING_THREAD: ${{ steps.discord_channel.outputs.require_existing_thread }}
           COMMENT_URL: ${{ steps.post_response.outputs.comment_url }}
           JOB_URL: ${{ steps.post_response.outputs.job_url }}
           DISCORD_OUTPUT: ${{ steps.post_response.outputs.discord_output }}
@@ -2410,6 +2468,11 @@ jobs:
                 ]
             except Exception:
               channel_candidates = []
+
+          require_existing_thread = (
+            str(os.environ.get("REQUIRE_EXISTING_THREAD", "")).strip().lower()
+            in {"1", "true", "yes"}
+          )
           if event_path:
             try:
               with open(event_path, "r", encoding="utf-8") as handle:
@@ -2445,6 +2508,7 @@ jobs:
             "thread_url": thread_url,
             "discord_channel_id": os.environ.get("DISCORD_CHANNEL_ID", ""),
             "discord_channel_candidates": channel_candidates,
+            "require_existing_thread": require_existing_thread,
             "comment_url": os.environ.get("COMMENT_URL", ""),
             "job_url": os.environ.get("JOB_URL", ""),
             "response_text": os.environ.get("DISCORD_OUTPUT", ""),
