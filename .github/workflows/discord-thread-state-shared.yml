@@ -374,6 +374,6 @@ jobs:
             if [ -z "${response_body}" ]; then
               response_body="<empty response body>"
             fi
-            echo "::warning::Discord thread-state delivery failed after ${max_attempts} attempts (curl=${curl_status}, http=${http_code:-n/a}, stderr=${curl_output}, body=${response_body})"
-            exit 0
+            echo "::error::Discord thread-state delivery failed after ${max_attempts} attempts (curl=${curl_status}, http=${http_code:-n/a}, stderr=${curl_output}, body=${response_body})"
+            exit 1
           fi
