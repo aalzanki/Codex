@@ -374,20 +374,43 @@ jobs:
             transcript_lines.append(f"{speaker}\n{content}")
           transcript = "\n\n---\n\n".join(transcript_lines) if transcript_lines else "(no prior messages)"
 
+          chat_standard_rules = [
+            "I use voice dictation; expect typos and confirm if ambiguous.",
+            "Don't guess & assume. If you're not sure what I mean, ask me.",
+            "If implementation intent is unclear, ask a clarifying question instead of editing.",
+            "You can update issue's description using gh. Do so as needed.",
+            "Do not make changes to the code. You can chat and analyze the code, GitHub, and workflows.",
+          ]
+          codex_standard_rules = [
+            "I use voice dictation; expect typos and confirm if ambiguous.",
+            "Don't guess & assume. If you're not sure what I mean, ask me.",
+            "If implementation intent is unclear, ask a clarifying question instead of editing.",
+            "Prefer deterministic, pure, functional code, with TDD.",
+            "Don't write flakey code that can break easily.",
+            "Refactor & reuse as needed to avoid duplicate code.",
+            "Commit only files relevant to the task. Do not include unrelated changes.",
+            "You can update issue's description using gh. Do so as needed.",
+            "Pass real newlines for PR bodies (via --body-file or a heredoc/printf).",
+          ]
+          issue_instructions = (
+            "If you made code changes, create a PR (make sure tests pass and link the issue in the PR description). "
+            "If you made code changes but decide not to create a PR, push your WIP branch and mention its name in your response."
+          )
           common_rules = [
             "You are responding in a Discord chat bridge session.",
             "Respond with plain text only. Do not use markdown code fences unless the user asks.",
             "Do not mention internal workflow details, secrets, or tokens.",
-            "You may inspect/edit code, run local commands/tests, and use GitHub CLI (gh) when the user asks.",
-            "Never push directly to main or production branches.",
-            "When code changes are needed outside an existing PR context, create a PR.",
-            "When the user asks to create or update issues/PRs, do it via gh.",
-            "Do not post status comments to GitHub unless the user explicitly asks for that.",
+            "Don't post comments on Github. To respond to the comment, our github workflow will automatically post your response to the Github as a comment.",
+            "Use the GitHub CLI (gh) to interact with GitHub (issues, PRs, comments).",
           ]
           if mode == "codex":
             persona_line = "You are Codex. Give pragmatic engineering guidance with concise, direct steps."
+            mode_rules = codex_standard_rules
+            change_rules = issue_instructions
           else:
             persona_line = "You are Chat. Give clear, practical answers and ask a clarifying question only when needed."
+            mode_rules = chat_standard_rules
+            change_rules = ""
 
           trigger_line = f"Triggered by GitHub user: @{trigger_login}" if trigger_login else "Triggered by GitHub user: <unknown>"
           trigger_message_block = (
@@ -403,7 +426,10 @@ jobs:
           )
           prompt = (
             f"{persona_line}\n"
+            + "\n".join(f"- {rule}" for rule in mode_rules)
+            + "\n"
             + "\n".join(f"- {rule}" for rule in common_rules)
+            + ("\n- " + change_rules if change_rules else "")
             + "\n\n"
             + f"Repository: {repository}\n"
             + f"Session key: {session_key}\n"
