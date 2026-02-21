@@ -24,10 +24,10 @@ on:
         required: true
         type: string
       mode:
-        description: "chat or codex"
+        description: "Reserved for future use; Discord chat runs in codex mode."
         required: false
         type: string
-        default: "chat"
+        default: "codex"
       trigger_login:
         description: "Linked GitHub login for the Discord user"
         required: false
@@ -53,11 +53,6 @@ on:
         required: false
         type: string
         default: ""
-      chat_model:
-        description: "Model used for chat mode"
-        required: false
-        type: string
-        default: "gpt-5.2"
     secrets:
       CODEX_GITHUB_APP_ID:
         required: true
@@ -315,7 +310,6 @@ jobs:
         shell: bash
         env:
           SESSION_FILE: ${{ steps.session.outputs.session_file }}
-          MODE_INPUT: ${{ inputs.mode }}
           PROMPT_TEXT: ${{ inputs.prompt_text }}
           TRIGGER_LOGIN: ${{ inputs.trigger_login }}
           DISCORD_USER_ID: ${{ inputs.discord_user_id }}
