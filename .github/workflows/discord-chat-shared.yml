@@ -120,10 +120,280 @@ jobs:
           app-id: ${{ secrets.CODEX_GITHUB_APP_ID }}
           private-key: ${{ secrets.CODEX_GITHUB_APP_PRIVATE_KEY }}
 
+      - name: Fetch chat session context
+        id: session
+        shell: bash
+        env:
+          WORKER_URL: ${{ inputs.worker_url }}
+          CHAT_SESSION_KEY: ${{ inputs.chat_session_key }}
+          CHAT_SESSION_TOKEN: ${{ inputs.chat_session_token }}
+        run: |
+          set -euo pipefail
+
+          SESSION_FILE="${RUNNER_TEMP}/discord-chat-session.json"
+          BASE_URL="${WORKER_URL%/}"
+
+          curl -fsS -G \
+            --data-urlencode "session_key=${CHAT_SESSION_KEY}" \
+            --data-urlencode "token=${CHAT_SESSION_TOKEN}" \
+            "${BASE_URL}/chat/session/live" \
+            -o "${SESSION_FILE}"
+
+          echo "session_file=${SESSION_FILE}" >> "$GITHUB_OUTPUT"
+
+      - name: Determine target branch from Discord context
+        id: branch
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+
+            const ISSUE_LINKED_PRS_QUERY = `
+              query ResolveIssueLinkedPullRequests(
+                $owner: String!
+                $repo: String!
+                $issueNumber: Int!
+                $linkedPrQueryLimit: Int!
+              ) {
+                repository(owner: $owner, name: $repo) {
+                  issue(number: $issueNumber) {
+                    closedByPullRequestsReferences(last: $linkedPrQueryLimit) {
+                      nodes {
+                        number
+                        url
+                        state
+                        isCrossRepository
+                        headRefName
+                        createdAt
+                      }
+                    }
+                    timelineItems(
+                      last: $linkedPrQueryLimit
+                      itemTypes: [CROSS_REFERENCED_EVENT, CONNECTED_EVENT]
+                    ) {
+                      nodes {
+                        __typename
+                        ... on CrossReferencedEvent {
+                          source {
+                            ... on PullRequest {
+                              number
+                              url
+                              state
+                              isCrossRepository
+                              headRefName
+                              createdAt
+                            }
+                          }
+                        }
+                        ... on ConnectedEvent {
+                          subject {
+                            ... on PullRequest {
+                              number
+                              url
+                              state
+                              isCrossRepository
+                              headRefName
+                              createdAt
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            `;
+
+            const ISSUE_LINKED_PRS_QUERY_LIMIT = 50;
+
+            const toIssueLinkedPullRequest = (node) => {
+              if (!node || typeof node !== 'object') {
+                return null;
+              }
+              if (typeof node.number !== 'number') {
+                return null;
+              }
+              return {
+                number: node.number,
+                url: typeof node.url === 'string' ? node.url : '',
+                state: typeof node.state === 'string' ? node.state : '',
+                isCrossRepository: node.isCrossRepository === true,
+                headRefName:
+                  typeof node.headRefName === 'string'
+                    ? node.headRefName.trim()
+                    : '',
+                createdAt:
+                  typeof node.createdAt === 'string' ? node.createdAt : '',
+              };
+            };
+
+            const toTimestamp = (createdAt) => {
+              const timestamp = Date.parse(createdAt);
+              return Number.isFinite(timestamp) ? timestamp : -1;
+            };
+
+            const compareIssueLinkedPullRequests = (left, right) => {
+              const createdAtDiff =
+                toTimestamp(left.createdAt) - toTimestamp(right.createdAt);
+              if (createdAtDiff !== 0) {
+                return createdAtDiff;
+              }
+              return left.number - right.number;
+            };
+
+            const selectActiveIssueLinkedPullRequest = (issueNode) => {
+              if (!issueNode) {
+                return null;
+              }
+
+              const byNumber = new Map();
+              const appendCandidate = (candidate) => {
+                if (!candidate) {
+                  return;
+                }
+                if (!byNumber.has(candidate.number)) {
+                  byNumber.set(candidate.number, candidate);
+                }
+              };
+
+              const closedByNodes =
+                issueNode.closedByPullRequestsReferences?.nodes || [];
+              for (const node of closedByNodes) {
+                appendCandidate(toIssueLinkedPullRequest(node));
+              }
+
+              const timelineNodes = issueNode.timelineItems?.nodes || [];
+              for (const timelineNode of timelineNodes) {
+                if (!timelineNode) {
+                  continue;
+                }
+                if (timelineNode.__typename === 'CrossReferencedEvent') {
+                  appendCandidate(toIssueLinkedPullRequest(timelineNode.source));
+                  continue;
+                }
+                if (timelineNode.__typename === 'ConnectedEvent') {
+                  appendCandidate(toIssueLinkedPullRequest(timelineNode.subject));
+                }
+              }
+
+              let activeCandidate = null;
+              for (const candidate of byNumber.values()) {
+                const isSafeCandidate =
+                  candidate.state === 'OPEN' &&
+                  candidate.isCrossRepository === false &&
+                  candidate.headRefName.length > 0;
+                if (!isSafeCandidate) {
+                  continue;
+                }
+
+                if (
+                  !activeCandidate ||
+                  compareIssueLinkedPullRequests(candidate, activeCandidate) > 0
+                ) {
+                  activeCandidate = candidate;
+                }
+              }
+
+              return activeCandidate;
+            };
+
+            const resolveIssueLinkedPullRequest = async ({
+              owner,
+              repo,
+              issueNumber,
+            }) => {
+              const response = await github.graphql(ISSUE_LINKED_PRS_QUERY, {
+                owner,
+                repo,
+                issueNumber,
+                linkedPrQueryLimit: ISSUE_LINKED_PRS_QUERY_LIMIT,
+              });
+              const issueNode = response?.repository?.issue || null;
+              return selectActiveIssueLinkedPullRequest(issueNode);
+            };
+
+            const sessionFile = String(process.env.SESSION_FILE || '').trim();
+            if (!sessionFile) {
+              core.setFailed('SESSION_FILE is required.');
+              return;
+            }
+
+            let payload = null;
+            try {
+              payload = JSON.parse(fs.readFileSync(sessionFile, 'utf8'));
+            } catch (error) {
+              core.setFailed(`Unable to parse session JSON: ${error.message}`);
+              return;
+            }
+
+            if (!payload || typeof payload !== 'object' || !payload.ok || !payload.found) {
+              core.setFailed('Worker session lookup failed before branch resolution.');
+              return;
+            }
+
+            const session = payload.session || {};
+            const issueType = String(session.issue_type || '').trim().toLowerCase();
+            const issueNumber = Number.parseInt(String(session.issue_number || ''), 10);
+            const threadUrl = String(session.thread_url || '').trim();
+
+            let branch = context.payload.repository?.default_branch || null;
+            let activePrNumber = '';
+            let activePrUrl = '';
+
+            if (issueType === 'pull_request' && Number.isFinite(issueNumber) && issueNumber > 0) {
+              const pr = await github.rest.pulls.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: issueNumber,
+              });
+              branch = pr.data?.head?.ref || branch;
+              activePrNumber = String(pr.data?.number || '');
+              activePrUrl = String(pr.data?.html_url || '');
+            } else if (issueType === 'issue' && Number.isFinite(issueNumber) && issueNumber > 0) {
+              try {
+                const linkedPullRequest = await resolveIssueLinkedPullRequest({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issueNumber,
+                });
+                if (linkedPullRequest) {
+                  branch = linkedPullRequest.headRefName;
+                  activePrNumber = String(linkedPullRequest.number);
+                  activePrUrl = linkedPullRequest.url || '';
+                }
+              } catch (error) {
+                core.warning(
+                  `Linked PR branch resolution failed for issue #${issueNumber}: ${error.message}`
+                );
+              }
+            }
+
+            if (!branch) {
+              const repo = await github.rest.repos.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+              });
+              branch = repo.data.default_branch;
+            }
+
+            core.setOutput('branch', branch || '');
+            core.setOutput('active_pr_number', activePrNumber);
+            core.setOutput('active_pr_url', activePrUrl || threadUrl);
+            core.setOutput('issue_type', issueType);
+            core.setOutput('issue_number', Number.isFinite(issueNumber) && issueNumber > 0 ? String(issueNumber) : '');
+            core.setOutput('thread_url', threadUrl);
+
+            const activePrDisplay = activePrNumber
+              ? `#${activePrNumber}${activePrUrl ? ` (${activePrUrl})` : ''}`
+              : 'none';
+            core.info(`Discord context branch: ${branch} (active PR: ${activePrDisplay})`);
+        env:
+          SESSION_FILE: ${{ steps.session.outputs.session_file }}
+
       - name: Checkout target branch (self-hosted)
         shell: bash
         env:
-          BRANCH: ${{ github.event.repository.default_branch || github.ref_name }}
+          BRANCH: ${{ steps.branch.outputs.branch }}
           REF_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
@@ -284,27 +554,6 @@ jobs:
           git config user.name "${CODEX_GIT_USER_NAME:-${GITHUB_ACTOR}}"
           git config user.email "${CODEX_GIT_USER_EMAIL:-${GITHUB_ACTOR}@users.noreply.github.com}"
 
-      - name: Fetch chat session context
-        id: session
-        shell: bash
-        env:
-          WORKER_URL: ${{ inputs.worker_url }}
-          CHAT_SESSION_KEY: ${{ inputs.chat_session_key }}
-          CHAT_SESSION_TOKEN: ${{ inputs.chat_session_token }}
-        run: |
-          set -euo pipefail
-
-          SESSION_FILE="${RUNNER_TEMP}/discord-chat-session.json"
-          BASE_URL="${WORKER_URL%/}"
-
-          curl -fsS -G \
-            --data-urlencode "session_key=${CHAT_SESSION_KEY}" \
-            --data-urlencode "token=${CHAT_SESSION_TOKEN}" \
-            "${BASE_URL}/chat/session/live" \
-            -o "${SESSION_FILE}"
-
-          echo "session_file=${SESSION_FILE}" >> "$GITHUB_OUTPUT"
-
       - name: Build Codex chat prompt
         id: prompt
         shell: bash
@@ -313,6 +562,9 @@ jobs:
           PROMPT_TEXT: ${{ inputs.prompt_text }}
           TRIGGER_LOGIN: ${{ inputs.trigger_login }}
           DISCORD_USER_ID: ${{ inputs.discord_user_id }}
+          TARGET_BRANCH: ${{ steps.branch.outputs.branch }}
+          ACTIVE_PR_NUMBER: ${{ steps.branch.outputs.active_pr_number }}
+          ACTIVE_PR_URL: ${{ steps.branch.outputs.active_pr_url }}
           CODEX_MODEL_INPUT: ${{ inputs.codex_model }}
           EXTRA_INSTRUCTIONS: ${{ inputs.extra_instructions }}
           EXTRA_COMMON_INSTRUCTIONS: ${{ inputs.extra_common_instructions }}
@@ -329,6 +581,9 @@ jobs:
           prompt_text = (os.environ.get("PROMPT_TEXT", "") or "").strip()
           trigger_login = (os.environ.get("TRIGGER_LOGIN", "") or "").strip()
           discord_user_id = (os.environ.get("DISCORD_USER_ID", "") or "").strip()
+          target_branch = (os.environ.get("TARGET_BRANCH", "") or "").strip()
+          active_pr_number = (os.environ.get("ACTIVE_PR_NUMBER", "") or "").strip()
+          active_pr_url = (os.environ.get("ACTIVE_PR_URL", "") or "").strip()
           codex_model = (os.environ.get("CODEX_MODEL_INPUT", "") or "").strip()
           extra_instructions = (os.environ.get("EXTRA_INSTRUCTIONS", "") or "").strip()
           extra_common_instructions = (os.environ.get("EXTRA_COMMON_INSTRUCTIONS", "") or "").strip()
@@ -351,9 +606,16 @@ jobs:
 
           repository = str(session.get("repository") or os.environ.get("GITHUB_REPOSITORY", "")).strip()
           session_key = str(session.get("session_key") or "").strip()
-          ref_name = str(os.environ.get("GITHUB_REF_NAME") or "").strip()
+          ref_name = target_branch or str(os.environ.get("GITHUB_REF_NAME") or "").strip()
           workspace = os.environ.get("GITHUB_WORKSPACE", "")
           discord_user_name = str(session.get("user_display_name") or "").strip()
+          thread_issue_type = str(session.get("issue_type") or "").strip().lower()
+          thread_issue_number_raw = str(session.get("issue_number") or "").strip()
+          thread_url = str(session.get("thread_url") or "").strip()
+          try:
+            thread_issue_number = int(thread_issue_number_raw) if thread_issue_number_raw else 0
+          except Exception:
+            thread_issue_number = 0
           raw_session_messages = session.get("messages")
           messages = raw_session_messages if isinstance(raw_session_messages, list) else []
 
@@ -470,6 +732,17 @@ jobs:
 
           discord_user_display = f"<@{discord_user_id}>" if discord_user_id else "<unknown>"
           linked_github_display = f"@{trigger_login}" if trigger_login else "<none>"
+          thread_context_line = "Thread context: none"
+          if thread_issue_number > 0 and thread_issue_type in ("issue", "pull_request"):
+            issue_label = "PR" if thread_issue_type == "pull_request" else "Issue"
+            thread_context_line = f"Thread context: {issue_label} #{thread_issue_number}"
+            if thread_url:
+              thread_context_line += f" ({thread_url})"
+          active_pr_line = "Active PR: none"
+          if active_pr_number:
+            active_pr_line = f"Active PR: #{active_pr_number}"
+            if active_pr_url:
+              active_pr_line += f" ({active_pr_url})"
           trigger_line = (
             f"Triggered by Discord user: {discord_user_name} ({discord_user_display})"
             if discord_user_name
@@ -497,7 +770,8 @@ jobs:
             + f"{trigger_line}\n"
             + f"Discord user name: {discord_user_name or '<unknown>'}\n"
             + f"Linked GitHub user: {linked_github_display}\n"
-            + "Active PR: none\n"
+            + f"{thread_context_line}\n"
+            + f"{active_pr_line}\n"
             + f"Workspace: {workspace}\n\n"
             + "Latest messages (oldest to newest):\n"
             + f"{comments_text}\n"

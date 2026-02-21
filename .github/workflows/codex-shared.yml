@@ -1494,7 +1494,7 @@ jobs:
 
       - name: Resolve Discord channel for trigger user (prompt mirror)
         id: discord_channel_prompt
-        if: ${{ inputs.discord_bridge_url != '' }}
+        if: ${{ false && inputs.discord_bridge_url != '' }}
         continue-on-error: true
         uses: actions/github-script@v7
         env:
@@ -1514,7 +1514,7 @@ jobs:
             core.info('Discord prompt mirror enabled; destination routing is resolved by bridge.');
 
       - name: Build Discord prompt mirror payload
-        if: ${{ inputs.discord_bridge_url != '' && steps.discord_channel_prompt.outputs.notify_discord == 'true' }}
+        if: ${{ false && inputs.discord_bridge_url != '' && steps.discord_channel_prompt.outputs.notify_discord == 'true' }}
         continue-on-error: true
         shell: bash
         env:
@@ -1657,7 +1657,7 @@ jobs:
           PY
 
       - name: Deliver Discord prompt mirror event
-        if: ${{ inputs.discord_bridge_url != '' && steps.discord_channel_prompt.outputs.notify_discord == 'true' }}
+        if: ${{ false && inputs.discord_bridge_url != '' && steps.discord_channel_prompt.outputs.notify_discord == 'true' }}
         continue-on-error: true
         shell: bash
         env:
