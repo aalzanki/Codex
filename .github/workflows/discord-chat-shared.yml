@@ -1,0 +1,352 @@
+name: Discord Chat Shared
+
+on:
+  workflow_call:
+    inputs:
+      runner_group:
+        description: "GitHub runner group for self-hosted runners"
+        required: true
+        type: string
+      worker_url:
+        description: "Public Cloudflare worker base URL"
+        required: true
+        type: string
+      chat_session_key:
+        description: "Chat session key from Discord gateway"
+        required: true
+        type: string
+      chat_session_token:
+        description: "Signed short-lived chat session token"
+        required: true
+        type: string
+      prompt_text:
+        description: "Latest user prompt text"
+        required: true
+        type: string
+      mode:
+        description: "chat or codex"
+        required: false
+        type: string
+        default: "chat"
+      trigger_login:
+        description: "GitHub login that triggered the dispatch"
+        required: false
+        type: string
+        default: ""
+      codex_model:
+        description: "Model used for codex mode"
+        required: false
+        type: string
+        default: "gpt-5.3-codex"
+      chat_model:
+        description: "Model used for chat mode"
+        required: false
+        type: string
+        default: "gpt-5.2"
+
+jobs:
+  discord_chat:
+    runs-on:
+      group: ${{ inputs.runner_group }}
+    permissions:
+      actions: write
+      checks: write
+      contents: write
+      deployments: write
+      id-token: write
+      issues: write
+      discussions: write
+      packages: write
+      pages: write
+      pull-requests: write
+      repository-projects: write
+      security-events: write
+      statuses: write
+    steps:
+      - name: Validate required inputs
+        shell: bash
+        env:
+          WORKER_URL: ${{ inputs.worker_url }}
+          CHAT_SESSION_KEY: ${{ inputs.chat_session_key }}
+          CHAT_SESSION_TOKEN: ${{ inputs.chat_session_token }}
+          PROMPT_TEXT: ${{ inputs.prompt_text }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${WORKER_URL:-}" ]; then
+            echo "worker_url input is required"
+            exit 1
+          fi
+          if [ -z "${CHAT_SESSION_KEY:-}" ]; then
+            echo "chat_session_key input is required"
+            exit 1
+          fi
+          if [ -z "${CHAT_SESSION_TOKEN:-}" ]; then
+            echo "chat_session_token input is required"
+            exit 1
+          fi
+          if [ -z "${PROMPT_TEXT:-}" ]; then
+            echo "prompt_text input is required"
+            exit 1
+          fi
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Locate Codex executable
+        id: exes
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -f ~/.local/bin/codex ]; then
+            CODEX_PATH=~/.local/bin/codex
+          elif [ -f /opt/homebrew/bin/codex ]; then
+            CODEX_PATH=/opt/homebrew/bin/codex
+          elif command -v codex >/dev/null 2>&1; then
+            CODEX_PATH=$(command -v codex)
+          else
+            echo "ERROR: codex not found"
+            exit 1
+          fi
+
+          echo "codex_path=$CODEX_PATH" >> "$GITHUB_OUTPUT"
+          echo "Found codex executable: $CODEX_PATH"
+
+      - name: Fetch chat session context
+        id: session
+        shell: bash
+        env:
+          WORKER_URL: ${{ inputs.worker_url }}
+          CHAT_SESSION_KEY: ${{ inputs.chat_session_key }}
+          CHAT_SESSION_TOKEN: ${{ inputs.chat_session_token }}
+        run: |
+          set -euo pipefail
+
+          SESSION_FILE="${RUNNER_TEMP}/discord-chat-session.json"
+          BASE_URL="${WORKER_URL%/}"
+
+          curl -fsS -G \
+            --data-urlencode "session_key=${CHAT_SESSION_KEY}" \
+            --data-urlencode "token=${CHAT_SESSION_TOKEN}" \
+            "${BASE_URL}/chat/session/get" \
+            -o "${SESSION_FILE}"
+
+          echo "session_file=${SESSION_FILE}" >> "$GITHUB_OUTPUT"
+
+      - name: Build Codex chat prompt
+        id: prompt
+        shell: bash
+        env:
+          SESSION_FILE: ${{ steps.session.outputs.session_file }}
+          MODE_INPUT: ${{ inputs.mode }}
+          PROMPT_TEXT: ${{ inputs.prompt_text }}
+          TRIGGER_LOGIN: ${{ inputs.trigger_login }}
+          CHAT_MODEL_INPUT: ${{ inputs.chat_model }}
+          CODEX_MODEL_INPUT: ${{ inputs.codex_model }}
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          session_file = os.environ["SESSION_FILE"]
+          mode_input = (os.environ.get("MODE_INPUT", "") or "").strip().lower()
+          prompt_text = (os.environ.get("PROMPT_TEXT", "") or "").strip()
+          trigger_login = (os.environ.get("TRIGGER_LOGIN", "") or "").strip()
+          chat_model = (os.environ.get("CHAT_MODEL_INPUT", "") or "").strip()
+          codex_model = (os.environ.get("CODEX_MODEL_INPUT", "") or "").strip()
+
+          with open(session_file, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+
+          if not isinstance(payload, dict) or not payload.get("ok"):
+            raise SystemExit("Worker session lookup failed.")
+          if not payload.get("found"):
+            raise SystemExit("Chat session was not found in worker storage.")
+
+          session = payload.get("session") or {}
+          if not isinstance(session, dict):
+            raise SystemExit("Session payload is invalid.")
+
+          mode = "codex" if mode_input == "codex" else "chat"
+          selected_model = codex_model if mode == "codex" else chat_model
+          if not selected_model:
+            raise SystemExit("No model selected for chat run.")
+
+          repository = str(session.get("repository") or os.environ.get("GITHUB_REPOSITORY", "")).strip()
+          session_key = str(session.get("session_key") or "").strip()
+          messages = session.get("messages") if isinstance(session.get("messages"), list) else []
+
+          normalized_messages = []
+          for message in messages[-40:]:
+            if not isinstance(message, dict):
+              continue
+            role = str(message.get("role") or "").strip().lower()
+            content = str(message.get("content") or "").strip()
+            if role not in ("user", "assistant") or not content:
+              continue
+            normalized_messages.append({"role": role, "content": content})
+
+          if not prompt_text:
+            for message in reversed(normalized_messages):
+              if message["role"] == "user":
+                prompt_text = message["content"]
+                break
+          if not prompt_text:
+            raise SystemExit("Latest prompt text is empty.")
+
+          transcript_lines = []
+          for message in normalized_messages:
+            speaker = "User" if message["role"] == "user" else "Assistant"
+            transcript_lines.append(f"{speaker}:\n{message['content']}")
+          transcript = "\n\n---\n\n".join(transcript_lines) if transcript_lines else "(no prior messages)"
+
+          common_rules = [
+            "You are responding in a Discord chat bridge session.",
+            "Respond with plain text only. Do not use markdown code fences unless the user asks.",
+            "Do not mention internal workflow, tokens, or infrastructure details.",
+            "Do not perform code edits, git operations, or GitHub mutations in this mode.",
+          ]
+          if mode == "codex":
+            persona_line = "You are Codex. Give pragmatic engineering guidance with concise, direct steps."
+          else:
+            persona_line = "You are Chat. Give clear, practical answers and ask a clarifying question only when needed."
+
+          trigger_line = f"Triggered by GitHub user: @{trigger_login}" if trigger_login else "Triggered by GitHub user: <unknown>"
+          prompt = (
+            f"{persona_line}\n"
+            + "\n".join(f"- {rule}" for rule in common_rules)
+            + "\n\n"
+            + f"Repository: {repository}\n"
+            + f"Session key: {session_key}\n"
+            + f"{trigger_line}\n\n"
+            + "Conversation history (oldest to newest):\n"
+            + f"{transcript}\n\n"
+            + "Latest user message:\n"
+            + f"{prompt_text}\n\n"
+            + "Reply to the latest user message."
+          )
+
+          prompt_path = Path(os.environ["GITHUB_WORKSPACE"]) / ".github" / "discord_chat_prompt.txt"
+          prompt_path.parent.mkdir(parents=True, exist_ok=True)
+          prompt_path.write_text(prompt, encoding="utf-8")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+            output.write(f"prompt_file={prompt_path}\n")
+            output.write(f"model={selected_model}\n")
+            output.write(f"mode={mode}\n")
+            output.write(f"repository={repository}\n")
+          PY
+
+      - name: Run Codex for Discord chat
+        id: codex
+        continue-on-error: true
+        shell: bash
+        env:
+          CODEX_PATH: ${{ steps.exes.outputs.codex_path }}
+          PROMPT_FILE: ${{ steps.prompt.outputs.prompt_file }}
+          CODEX_MODEL: ${{ steps.prompt.outputs.model }}
+          GITHUB_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ github.token }}
+          CODEX_GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${CODEX_PATH:-}" ] || [ ! -x "${CODEX_PATH}" ]; then
+            echo "ERROR: codex executable is missing"
+            exit 1
+          fi
+          if [ -z "${PROMPT_FILE:-}" ] || [ ! -f "${PROMPT_FILE}" ]; then
+            echo "ERROR: prompt file is missing"
+            exit 1
+          fi
+          if [ -z "${CODEX_MODEL:-}" ]; then
+            echo "ERROR: selected model is empty"
+            exit 1
+          fi
+
+          TASK="$(cat "${PROMPT_FILE}")"
+          OUTPUT_FILE="${GITHUB_WORKSPACE}/.github/discord_chat_output.txt"
+
+          echo "Running model: ${CODEX_MODEL}"
+          "${CODEX_PATH}" exec --model "${CODEX_MODEL}" --yolo "${TASK}" > "${OUTPUT_FILE}"
+          echo "output_file=${OUTPUT_FILE}" >> "$GITHUB_OUTPUT"
+
+      - name: Build bridge response payload
+        id: response_payload
+        if: always()
+        shell: bash
+        env:
+          CHAT_SESSION_KEY: ${{ inputs.chat_session_key }}
+          CHAT_SESSION_TOKEN: ${{ inputs.chat_session_token }}
+          CODEX_OUTPUT_FILE: ${{ steps.codex.outputs.output_file }}
+          CODEX_OUTCOME: ${{ steps.codex.outcome }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          PAYLOAD_FILE: ${{ runner.temp }}/discord-chat-response.json
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          session_key = (os.environ.get("CHAT_SESSION_KEY", "") or "").strip()
+          session_token = (os.environ.get("CHAT_SESSION_TOKEN", "") or "").strip()
+          output_file = (os.environ.get("CODEX_OUTPUT_FILE", "") or "").strip()
+          codex_outcome = (os.environ.get("CODEX_OUTCOME", "") or "").strip().lower()
+          run_url = (os.environ.get("RUN_URL", "") or "").strip()
+          payload_file = (os.environ.get("PAYLOAD_FILE", "") or "").strip()
+
+          response_text = ""
+          if output_file:
+            candidate = Path(output_file)
+            if candidate.exists():
+              response_text = candidate.read_text(encoding="utf-8", errors="replace").strip()
+
+          if not response_text:
+            if codex_outcome == "success":
+              response_text = "Completed successfully, but no response text was produced."
+            else:
+              response_text = "Run failed before producing a response. Open the workflow run for details."
+
+          outcome = "success" if codex_outcome == "success" else "failure"
+          payload = {
+            "session_key": session_key,
+            "token": session_token,
+            "response_text": response_text,
+            "outcome": outcome,
+            "run_url": run_url,
+          }
+
+          with open(payload_file, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False)
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+            output.write(f"payload_file={payload_file}\n")
+          PY
+
+      - name: Deliver response to Discord bridge
+        if: always()
+        shell: bash
+        env:
+          WORKER_URL: ${{ inputs.worker_url }}
+          PAYLOAD_FILE: ${{ steps.response_payload.outputs.payload_file }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${PAYLOAD_FILE:-}" ] || [ ! -f "${PAYLOAD_FILE}" ]; then
+            echo "ERROR: response payload file missing"
+            exit 1
+          fi
+
+          curl -fsS \
+            -X POST \
+            -H "Content-Type: application/json" \
+            --data-binary @"${PAYLOAD_FILE}" \
+            "${WORKER_URL%/}/chat/session/respond" >/dev/null
