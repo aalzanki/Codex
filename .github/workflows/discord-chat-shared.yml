@@ -46,6 +46,14 @@ on:
 
 jobs:
   discord_chat:
+    concurrency:
+      group: >-
+        ${{ format(
+          'discord-chat:{0}:{1}',
+          github.repository,
+          inputs.chat_session_key
+        ) }}
+      cancel-in-progress: true
     runs-on:
       group: ${{ inputs.runner_group }}
     permissions:

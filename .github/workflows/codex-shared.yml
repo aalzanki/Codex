@@ -96,6 +96,15 @@ on:
 
 jobs:
   codex:
+    concurrency:
+      group: >-
+        ${{ format(
+          'codex-thread:{0}:{1}:{2}',
+          github.repository,
+          inputs.trigger_phrase,
+          github.event.issue.number || github.event.pull_request.number || github.event.number || github.ref_name || github.run_id
+        ) }}
+      cancel-in-progress: true
     runs-on:
       group: ${{ inputs.runner_group }}
     permissions:
