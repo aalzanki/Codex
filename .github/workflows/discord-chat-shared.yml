@@ -309,8 +309,18 @@ jobs:
           session_key = str(session.get("session_key") or "").strip()
           messages = session.get("messages") if isinstance(session.get("messages"), list) else []
 
+          MAX_CONTEXT_MESSAGES = 30
+          MAX_NEWEST_MESSAGES = 2
+          OLDER_MESSAGE_CHAR_LIMIT = 8000
+
+          def truncate(text: str, max_chars: int) -> str:
+            normalized = str(text or "")
+            if len(normalized) <= max_chars:
+              return normalized
+            return normalized[:max_chars] + "...(truncated)"
+
           normalized_messages = []
-          for message in messages[-40:]:
+          for message in messages[-80:]:
             if not isinstance(message, dict):
               continue
             role = str(message.get("role") or "").strip().lower()
@@ -318,6 +328,16 @@ jobs:
             if role not in ("user", "assistant") or not content:
               continue
             normalized_messages.append({"role": role, "content": content})
+          deduped_messages = []
+          for message in normalized_messages:
+            if (
+              deduped_messages
+              and deduped_messages[-1]["role"] == message["role"]
+              and deduped_messages[-1]["content"] == message["content"]
+            ):
+              continue
+            deduped_messages.append(message)
+          normalized_messages = deduped_messages[-MAX_CONTEXT_MESSAGES:]
 
           if not prompt_text:
             for message in reversed(normalized_messages):
@@ -327,10 +347,22 @@ jobs:
           if not prompt_text:
             raise SystemExit("Latest prompt text is empty.")
 
+          latest_message_matches_prompt = bool(
+            normalized_messages
+            and normalized_messages[-1]["role"] == "user"
+            and normalized_messages[-1]["content"] == prompt_text
+          )
+
           transcript_lines = []
-          for message in normalized_messages:
+          newest_start_index = max(0, len(normalized_messages) - MAX_NEWEST_MESSAGES)
+          for index, message in enumerate(normalized_messages):
             speaker = "User" if message["role"] == "user" else "Assistant"
-            transcript_lines.append(f"{speaker}:\n{message['content']}")
+            content = (
+              message["content"]
+              if index >= newest_start_index
+              else truncate(message["content"], OLDER_MESSAGE_CHAR_LIMIT)
+            )
+            transcript_lines.append(f"{speaker}\n{content}")
           transcript = "\n\n---\n\n".join(transcript_lines) if transcript_lines else "(no prior messages)"
 
           common_rules = [
@@ -345,6 +377,17 @@ jobs:
             persona_line = "You are Chat. Give clear, practical answers and ask a clarifying question only when needed."
 
           trigger_line = f"Triggered by GitHub user: @{trigger_login}" if trigger_login else "Triggered by GitHub user: <unknown>"
+          trigger_message_block = (
+            "Trigger message:\n"
+            + f"{prompt_text}\n\n"
+            if not latest_message_matches_prompt
+            else ""
+          )
+          trigger_reference_line = (
+            "The newest User message in Latest messages is the trigger for this run."
+            if latest_message_matches_prompt
+            else "Use the Trigger message above as the request to answer."
+          )
           prompt = (
             f"{persona_line}\n"
             + "\n".join(f"- {rule}" for rule in common_rules)
@@ -352,11 +395,11 @@ jobs:
             + f"Repository: {repository}\n"
             + f"Session key: {session_key}\n"
             + f"{trigger_line}\n\n"
-            + "Conversation history (oldest to newest):\n"
+            + "Latest messages (oldest to newest):\n"
             + f"{transcript}\n\n"
-            + "Latest user message:\n"
-            + f"{prompt_text}\n\n"
-            + "Reply to the latest user message."
+            + trigger_message_block
+            + f"{trigger_reference_line}\n\n"
+            + "Reply directly to the user request."
           )
 
           prompt_path = Path(os.environ["GITHUB_WORKSPACE"]) / ".github" / "discord_chat_prompt.txt"
