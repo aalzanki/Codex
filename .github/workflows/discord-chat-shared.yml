@@ -90,10 +90,137 @@ jobs:
             exit 1
           fi
 
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
+      - name: Checkout target branch (self-hosted)
+        shell: bash
+        env:
+          BRANCH: ${{ github.event.repository.default_branch || github.ref_name }}
+          REF_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          # Use the same self-hosted checkout flow used by Codex shared workflows.
+          # Do not replace this with actions/checkout.
+          if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+            echo "::error::OIDC env vars missing; ensure job permissions include 'id-token: write'."
+            exit 1
+          fi
+          oidc_url="${ACTIONS_ID_TOKEN_REQUEST_URL}"
+
+          oidc_body="${RUNNER_TEMP}/oidc-token.json"
+          oidc_headers="${RUNNER_TEMP}/oidc-token.headers"
+          rm -f "$oidc_body" "$oidc_headers"
+
+          set +e
+          oidc_http_code="$(
+            curl -sS \
+              -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+              -H "Accept: application/json" \
+              -D "$oidc_headers" \
+              -o "$oidc_body" \
+              -w "%{http_code}" \
+              "$oidc_url"
+          )"
+          curl_rc="$?"
+          set -e
+          if [ "$curl_rc" -ne 0 ]; then
+            echo "::error::Failed to request OIDC token (curl exit ${curl_rc})."
+            exit 1
+          fi
+          if [ "$oidc_http_code" != "200" ]; then
+            http_line="$(head -n 1 "$oidc_headers" | tr -d '\r')"
+            location="$(
+              grep -i '^location:' "$oidc_headers" | head -n 1 | sed -E 's/^[Ll]ocation:[[:space:]]*//' | tr -d '\r' || true
+            )"
+            body_bytes="$(wc -c < "$oidc_body" | tr -d ' ')"
+            echo "::error::OIDC token request failed (${http_line:-HTTP ${oidc_http_code}})."
+            if [ -n "$location" ]; then
+              echo "::error::OIDC token request redirected to: ${location}"
+            fi
+            echo "::error::OIDC token response body bytes: ${body_bytes}"
+            exit 1
+          fi
+
+          workflow_claims="$(python3 - "$oidc_body" <<'PY'
+          import base64
+          import json
+          import sys
+
+          oidc_body = sys.argv[1]
+          raw = open(oidc_body, "r", encoding="utf-8").read()
+          if not raw.strip():
+            raise SystemExit("OIDC token response is empty")
+
+          data = json.loads(raw)
+          if not isinstance(data, dict):
+            raise SystemExit("OIDC token response is not a JSON object")
+
+          token = (
+            (data.get("value") or "")
+            or (data.get("token") or "")
+            or (data.get("id_token") or "")
+          ).strip()
+          if not token:
+            keys = sorted(list(data.keys()))
+            raise SystemExit(f"OIDC token response missing token field (keys: {keys})")
+
+          parts = token.split(".")
+          if len(parts) < 2:
+            raise SystemExit("OIDC token is not a JWT")
+
+          payload_b64 = parts[1]
+          payload_b64 += "=" * (-len(payload_b64) % 4)
+
+          payload = base64.urlsafe_b64decode(payload_b64.encode("utf-8")).decode("utf-8")
+          claims = json.loads(payload)
+
+          called_workflow_ref = (
+            (claims.get("job_workflow_ref") or "")
+            or (claims.get("workflow_ref") or "")
+          ).strip()
+          called_workflow_sha = (
+            (claims.get("job_workflow_sha") or "")
+            or (claims.get("workflow_sha") or "")
+          ).strip()
+          if not called_workflow_ref:
+            keys = sorted(list(claims.keys()))
+            raise SystemExit(f"OIDC token missing workflow_ref claim (keys: {keys})")
+          print(called_workflow_ref)
+          print(called_workflow_sha)
+          PY
+          )"
+
+          called_workflow_ref="$(printf '%s' "$workflow_claims" | sed -n '1p')"
+          called_workflow_sha="$(printf '%s' "$workflow_claims" | sed -n '2p')"
+          if [ -z "$called_workflow_ref" ]; then
+            echo "::error::Unable to resolve called workflow ref from OIDC token; cannot locate shared checkout script."
+            exit 1
+          fi
+
+          workflow_repo_path="${called_workflow_ref%@*}"
+          workflow_repo="$(printf '%s' "$workflow_repo_path" | cut -d/ -f1-2)"
+          ref="$called_workflow_sha"
+          if [ -z "$ref" ]; then
+            case "$called_workflow_ref" in
+              *@*) ref="${called_workflow_ref#*@}" ;;
+              *)
+                echo "::error::Called workflow ref is missing an @<ref> suffix: ${called_workflow_ref}"
+                exit 1
+                ;;
+            esac
+            case "$ref" in
+              refs/heads/*) ref="${ref#refs/heads/}" ;;
+              refs/tags/*) ref="${ref#refs/tags/}" ;;
+            esac
+          fi
+          echo "Resolved reusable workflow source: ${workflow_repo}@${ref}"
+
+          checkout_script="${RUNNER_TEMP}/self-hosted-checkout.sh"
+          script_url="https://raw.githubusercontent.com/${workflow_repo}/${ref}/.github/scripts/self-hosted-checkout.sh"
+          echo "Fetching shared checkout script: ${script_url}"
+          curl -fsSL "$script_url" -o "$checkout_script"
+          chmod +x "$checkout_script"
+
+          bash "$checkout_script"
 
       - name: Locate Codex executable
         id: exes
