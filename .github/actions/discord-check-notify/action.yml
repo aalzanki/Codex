@@ -699,6 +699,7 @@ runs:
               fi
 
               resolved_destination="${INPUT_DISCORD_THREAD_ID:-}"
+              response_summary=""
               if [ -s "${RESPONSE_FILE}" ]; then
                 parsed_destination="$(
                   node -e "const fs=require('fs'); try { const p=JSON.parse(fs.readFileSync(process.env.RESPONSE_FILE,'utf8')); const v=String((p && p.destination_channel_id) || '').trim(); if (v) process.stdout.write(v); } catch {}"
@@ -706,6 +707,16 @@ runs:
                 if [ -n "${parsed_destination}" ]; then
                   resolved_destination="${parsed_destination}"
                 fi
+                response_summary="$(
+                  node -e "const fs=require('fs'); try { const p=JSON.parse(fs.readFileSync(process.env.RESPONSE_FILE,'utf8')); const view={ ok:Boolean(p&&p.ok), skipped:Boolean(p&&p.skipped), reason:String((p&&p.reason)||''), event_kind:String((p&&p.event_kind)||''), destination_channel_id:String((p&&p.destination_channel_id)||''), issue_type:String((p&&p.issue_type)||''), issue_number:Number((p&&p.issue_number)||0), has_dedicated_pr_thread:Boolean(p&&p.has_dedicated_pr_thread) }; process.stdout.write(JSON.stringify(view)); } catch {}"
+                )"
+              fi
+
+              if [ -n "${response_summary}" ]; then
+                echo "::notice::Discord bridge response summary: ${response_summary}"
+              fi
+              if [ -z "${resolved_destination}" ]; then
+                echo "::warning::Discord bridge returned no destination_channel_id for this check update."
               fi
 
               echo "destination_channel_id=${resolved_destination}" >> "$GITHUB_OUTPUT"
