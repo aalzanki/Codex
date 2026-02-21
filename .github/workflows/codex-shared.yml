@@ -1503,110 +1503,15 @@ jobs:
           DISCORD_CHANNEL_MAP_SECRET: ${{ secrets.DISCORD_CHANNEL_MAP }}
         with:
           script: |
-            const normalizeLogin = (value) =>
-              String(value || '')
-                .trim()
-                .replace(/^@/, '')
-                .toLowerCase();
-
-            const parseChannelMap = (raw) => {
-              const normalized = String(raw || '').trim();
-              if (!normalized) {
-                return {};
-              }
-
-              const appendEntry = (target, key, value) => {
-                const login = normalizeLogin(key);
-                const channelId = String(value || '').trim();
-                if (!login || !channelId) {
-                  return;
-                }
-                target[login] = channelId;
-              };
-
-              if (normalized.startsWith('{')) {
-                try {
-                  const parsed = JSON.parse(normalized);
-                  if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-                    const mapped = {};
-                    for (const [key, value] of Object.entries(parsed)) {
-                      appendEntry(mapped, key, value);
-                    }
-                    return mapped;
-                  }
-                  core.warning('discord_channel_map JSON must be an object; ignoring payload.');
-                  return {};
-                } catch (error) {
-                  core.warning(`Unable to parse discord_channel_map JSON payload: ${error.message}`);
-                }
-              }
-
-              const mapped = {};
-              const lines = normalized.split(/\r?\n/);
-              for (let i = 0; i < lines.length; i += 1) {
-                const line = lines[i].trim();
-                if (!line || line.startsWith('#')) {
-                  continue;
-                }
-                const separatorIndex = line.indexOf('=');
-                if (separatorIndex <= 0) {
-                  core.warning(`Ignoring invalid discord_channel_map line ${i + 1}; expected login=channel_id.`);
-                  continue;
-                }
-                appendEntry(
-                  mapped,
-                  line.slice(0, separatorIndex),
-                  line.slice(separatorIndex + 1)
-                );
-              }
-              return mapped;
-            };
-
-            const unique = (values) => {
-              const seen = new Set();
-              const out = [];
-              for (const value of values) {
-                const normalized = String(value || '').trim();
-                if (!normalized || seen.has(normalized)) {
-                  continue;
-                }
-                seen.add(normalized);
-                out.push(normalized);
-              }
-              return out;
-            };
-
-            const channelMap = {
-              ...parseChannelMap(process.env.DISCORD_CHANNEL_MAP_INPUT || ''),
-              ...parseChannelMap(process.env.DISCORD_CHANNEL_MAP_SECRET || ''),
-            };
-            const channelCandidates = unique(Object.values(channelMap));
-
-            const triggerLogin = normalizeLogin(process.env.TRIGGER_LOGIN || '');
+            const triggerLogin = String(process.env.TRIGGER_LOGIN || '')
+              .trim()
+              .replace(/^@/, '')
+              .toLowerCase();
             core.setOutput('trigger_login', triggerLogin);
             core.setOutput('channel_id', '');
-            core.setOutput('channel_candidates_json', JSON.stringify(channelCandidates));
-            core.setOutput('notify_discord', 'false');
-            if (!triggerLogin) {
-              core.info('Trigger login missing; Discord prompt mirror disabled.');
-              return;
-            }
-
-            const channelId = channelMap[triggerLogin] || '';
-            if (!channelId) {
-              core.info(`No Discord channel mapping found for @${triggerLogin}; skipping prompt mirror.`);
-              return;
-            }
-
-            const isSnowflake = /^[0-9]{6,}$/.test(channelId);
-            if (!isSnowflake) {
-              core.warning(`Invalid Discord channel ID mapped for @${triggerLogin}; expected numeric snowflake.`);
-              return;
-            }
-
-            core.setOutput('channel_id', channelId);
+            core.setOutput('channel_candidates_json', '[]');
             core.setOutput('notify_discord', 'true');
-            core.info(`Discord channel resolved for @${triggerLogin} (prompt mirror).`);
+            core.info('Discord prompt mirror enabled; destination routing is resolved by bridge.');
 
       - name: Build Discord prompt mirror payload
         if: ${{ inputs.discord_bridge_url != '' && steps.discord_channel_prompt.outputs.notify_discord == 'true' }}
@@ -2312,124 +2217,16 @@ jobs:
           DISCORD_CHANNEL_MAP_SECRET: ${{ secrets.DISCORD_CHANNEL_MAP }}
         with:
           script: |
-            const normalizeLogin = (value) =>
-              String(value || '')
-                .trim()
-                .replace(/^@/, '')
-                .toLowerCase();
-
-            const parseChannelMap = (raw) => {
-              const normalized = String(raw || '').trim();
-              if (!normalized) {
-                return {};
-              }
-
-              const appendEntry = (target, key, value) => {
-                const login = normalizeLogin(key);
-                const channelId = String(value || '').trim();
-                if (!login || !channelId) {
-                  return;
-                }
-                target[login] = channelId;
-              };
-
-              if (normalized.startsWith('{')) {
-                try {
-                  const parsed = JSON.parse(normalized);
-                  if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-                    const mapped = {};
-                    for (const [key, value] of Object.entries(parsed)) {
-                      appendEntry(mapped, key, value);
-                    }
-                    return mapped;
-                  }
-                  core.warning('discord_channel_map JSON must be an object; ignoring payload.');
-                  return {};
-                } catch (error) {
-                  core.warning(`Unable to parse discord_channel_map JSON payload: ${error.message}`);
-                }
-              }
-
-              const mapped = {};
-              const lines = normalized.split(/\r?\n/);
-              for (let i = 0; i < lines.length; i += 1) {
-                const line = lines[i].trim();
-                if (!line || line.startsWith('#')) {
-                  continue;
-                }
-                const separatorIndex = line.indexOf('=');
-                if (separatorIndex <= 0) {
-                  core.warning(`Ignoring invalid discord_channel_map line ${i + 1}; expected login=channel_id.`);
-                  continue;
-                }
-                appendEntry(
-                  mapped,
-                  line.slice(0, separatorIndex),
-                  line.slice(separatorIndex + 1)
-                );
-              }
-              return mapped;
-            };
-
-            const unique = (values) => {
-              const seen = new Set();
-              const out = [];
-              for (const value of values) {
-                const normalized = String(value || '').trim();
-                if (!normalized || seen.has(normalized)) {
-                  continue;
-                }
-                seen.add(normalized);
-                out.push(normalized);
-              }
-              return out;
-            };
-
-            const channelMap = {
-              ...parseChannelMap(process.env.DISCORD_CHANNEL_MAP_INPUT || ''),
-              ...parseChannelMap(process.env.DISCORD_CHANNEL_MAP_SECRET || ''),
-            };
-            const channelCandidates = unique(Object.values(channelMap));
-
-            const triggerLogin = normalizeLogin(process.env.TRIGGER_LOGIN || '');
+            const triggerLogin = String(process.env.TRIGGER_LOGIN || '')
+              .trim()
+              .replace(/^@/, '')
+              .toLowerCase();
             core.setOutput('trigger_login', triggerLogin);
             core.setOutput('channel_id', '');
-            core.setOutput('channel_candidates_json', JSON.stringify(channelCandidates));
-            core.setOutput('notify_discord', 'false');
-            core.setOutput('require_existing_thread', 'false');
-            if (!triggerLogin) {
-              if (channelCandidates.length > 0) {
-                core.setOutput('notify_discord', 'true');
-                core.setOutput('require_existing_thread', 'true');
-                core.info('Trigger login missing; using existing-thread delivery fallback across channel candidates.');
-              } else {
-                core.info('Trigger login missing; Discord bridge notification disabled.');
-              }
-              return;
-            }
-
-            const channelId = channelMap[triggerLogin] || '';
-            if (!channelId) {
-              if (channelCandidates.length > 0) {
-                core.setOutput('notify_discord', 'true');
-                core.setOutput('require_existing_thread', 'true');
-                core.info(`No direct Discord channel mapping found for @${triggerLogin}; attempting existing-thread delivery across channel candidates.`);
-              } else {
-                core.info(`No Discord channel mapping found for @${triggerLogin}; skipping bridge notification.`);
-              }
-              return;
-            }
-
-            const isSnowflake = /^[0-9]{6,}$/.test(channelId);
-            if (!isSnowflake) {
-              core.warning(`Invalid Discord channel ID mapped for @${triggerLogin}; expected numeric snowflake.`);
-              return;
-            }
-
-            core.setOutput('channel_id', channelId);
+            core.setOutput('channel_candidates_json', '[]');
             core.setOutput('notify_discord', 'true');
             core.setOutput('require_existing_thread', 'false');
-            core.info(`Discord channel resolved for @${triggerLogin}.`);
+            core.info('Discord bridge notification enabled; destination routing is resolved by bridge.');
 
       - name: Post Discord bridge event
         if: ${{ always() && inputs.discord_bridge_url != '' && steps.post_response.outputs.comment_url != '' && steps.discord_channel.outputs.notify_discord == 'true' }}
