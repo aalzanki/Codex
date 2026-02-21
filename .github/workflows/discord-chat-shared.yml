@@ -29,7 +29,12 @@ on:
         type: string
         default: "chat"
       trigger_login:
-        description: "GitHub login that triggered the dispatch"
+        description: "Linked GitHub login for the Discord user"
+        required: false
+        type: string
+        default: ""
+      discord_user_id:
+        description: "Discord user ID that triggered the dispatch"
         required: false
         type: string
         default: ""
@@ -289,8 +294,8 @@ jobs:
           MODE_INPUT: ${{ inputs.mode }}
           PROMPT_TEXT: ${{ inputs.prompt_text }}
           TRIGGER_LOGIN: ${{ inputs.trigger_login }}
+          DISCORD_USER_ID: ${{ inputs.discord_user_id }}
           CODEX_MODEL_INPUT: ${{ inputs.codex_model }}
-          CODEX_GH_TOKEN: ${{ github.token }}
           EXTRA_INSTRUCTIONS: ${{ inputs.extra_instructions }}
           EXTRA_COMMON_INSTRUCTIONS: ${{ inputs.extra_common_instructions }}
         run: |
@@ -305,8 +310,8 @@ jobs:
           session_file = os.environ["SESSION_FILE"]
           prompt_text = (os.environ.get("PROMPT_TEXT", "") or "").strip()
           trigger_login = (os.environ.get("TRIGGER_LOGIN", "") or "").strip()
+          discord_user_id = (os.environ.get("DISCORD_USER_ID", "") or "").strip()
           codex_model = (os.environ.get("CODEX_MODEL_INPUT", "") or "").strip()
-          github_token = (os.environ.get("CODEX_GH_TOKEN", "") or "").strip()
           extra_instructions = (os.environ.get("EXTRA_INSTRUCTIONS", "") or "").strip()
           extra_common_instructions = (os.environ.get("EXTRA_COMMON_INSTRUCTIONS", "") or "").strip()
 
@@ -423,8 +428,8 @@ jobs:
           ).strip()
 
           common_instructions = textwrap.dedent(
-            f"""\
-            * To download attachments, use: `curl -H "Authorization: Bearer {github_token}" -L "<attachment-url>" -o "<filename>"`. Download one file at a time, use the exact format i provided, don't try to create a script to combine downloads or use tmp directories. Stick to a single file with that exact format.
+            """\
+            * To download attachments from Discord messages, use: `curl -L "<attachment-url>" -o "<filename>"`. Download one file at a time, use the exact format i provided, don't try to create a script to combine downloads or use tmp directories. Stick to a single file with that exact format.
             """
           ).strip()
 
@@ -442,7 +447,9 @@ jobs:
             "If you made code changes but decide not to create a PR, push your WIP branch and mention its name in your response."
           )
 
-          trigger_line = f"Triggered by GitHub user: @{trigger_login}" if trigger_login else "Triggered by GitHub user: <unknown>"
+          discord_user_display = f"<@{discord_user_id}>" if discord_user_id else "<unknown>"
+          linked_github_display = f"@{trigger_login}" if trigger_login else "<none>"
+          trigger_line = f"Triggered by Discord user: {discord_user_display}"
           prompt = (
             codex_instructions
             + "\n"
@@ -454,7 +461,8 @@ jobs:
               f"""\
               * Don't post comments on Github. To respond to the user, our workflow will automatically post your response to Discord.
               * Use the GitHub CLI (gh) to interact with GitHub (issues, PRs, comments).
-              * You're @codex. You were triggered by GitHub user: {f"@{trigger_login}" if trigger_login else "<unknown>"}.
+              * You're @codex. You were triggered by Discord user: {discord_user_display}.
+              * The linked GitHub user for this Discord session is: {linked_github_display}.
               """
             ).strip()
             + "\n\n"
@@ -462,6 +470,7 @@ jobs:
             + f"Session key: {session_key}\n"
             + f"Current branch: {ref_name or '<unknown>'}\n"
             + f"{trigger_line}\n"
+            + f"Linked GitHub user: {linked_github_display}\n"
             + "Active PR: none\n"
             + f"Workspace: {workspace}\n\n"
             + "Latest messages (oldest to newest):\n"
