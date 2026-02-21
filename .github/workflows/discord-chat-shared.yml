@@ -315,6 +315,7 @@ jobs:
 
           repository = str(session.get("repository") or os.environ.get("GITHUB_REPOSITORY", "")).strip()
           session_key = str(session.get("session_key") or "").strip()
+          ref_name = str(os.environ.get("GITHUB_REF_NAME") or "").strip()
           messages = session.get("messages") if isinstance(session.get("messages"), list) else []
 
           MAX_CONTEXT_MESSAGES = 30
@@ -376,8 +377,12 @@ jobs:
           common_rules = [
             "You are responding in a Discord chat bridge session.",
             "Respond with plain text only. Do not use markdown code fences unless the user asks.",
-            "Do not mention internal workflow, tokens, or infrastructure details.",
-            "Do not perform code edits, git operations, or GitHub mutations in this mode.",
+            "Do not mention internal workflow details, secrets, or tokens.",
+            "You may inspect/edit code, run local commands/tests, and use GitHub CLI (gh) when the user asks.",
+            "Never push directly to main or production branches.",
+            "When code changes are needed outside an existing PR context, create a PR.",
+            "When the user asks to create or update issues/PRs, do it via gh.",
+            "Do not post status comments to GitHub unless the user explicitly asks for that.",
           ]
           if mode == "codex":
             persona_line = "You are Codex. Give pragmatic engineering guidance with concise, direct steps."
@@ -402,6 +407,7 @@ jobs:
             + "\n\n"
             + f"Repository: {repository}\n"
             + f"Session key: {session_key}\n"
+            + f"Current branch: {ref_name or '<unknown>'}\n"
             + f"{trigger_line}\n\n"
             + "Latest messages (oldest to newest):\n"
             + f"{transcript}\n\n"
