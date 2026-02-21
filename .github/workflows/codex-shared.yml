@@ -1269,6 +1269,25 @@ jobs:
           extra_instructions = os.environ.get("EXTRA_INSTRUCTIONS", "").strip()
           extra_common_instructions = os.environ.get("EXTRA_COMMON_INSTRUCTIONS", "").strip()
 
+          repo_extra_instructions_path = (
+            Path(workspace) / ".github" / "codex-extra-instructions.md"
+          )
+          if repo_extra_instructions_path.exists():
+            extra_instructions = (
+              (extra_instructions + "\n" + repo_extra_instructions_path.read_text(encoding="utf-8"))
+              if extra_instructions
+              else repo_extra_instructions_path.read_text(encoding="utf-8")
+            )
+          repo_extra_common_instructions_path = (
+            Path(workspace) / ".github" / "codex-extra-common-instructions.md"
+          )
+          if repo_extra_common_instructions_path.exists():
+            extra_common_instructions = (
+              (extra_common_instructions + "\n" + repo_extra_common_instructions_path.read_text(encoding="utf-8"))
+              if extra_common_instructions
+              else repo_extra_common_instructions_path.read_text(encoding="utf-8")
+            )
+
           def append_instruction_block(base, extra):
             extra = (extra or "").strip()
             if not extra:

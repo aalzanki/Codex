@@ -38,6 +38,16 @@ on:
         required: false
         type: string
         default: "gpt-5.3-codex"
+      extra_instructions:
+        description: "Additional prompt instructions appended after the base instructions."
+        required: false
+        type: string
+        default: ""
+      extra_common_instructions:
+        description: "Additional prompt instructions appended after the common instructions block."
+        required: false
+        type: string
+        default: ""
       chat_model:
         description: "Model used for chat mode"
         required: false
@@ -279,22 +289,26 @@ jobs:
           MODE_INPUT: ${{ inputs.mode }}
           PROMPT_TEXT: ${{ inputs.prompt_text }}
           TRIGGER_LOGIN: ${{ inputs.trigger_login }}
-          CHAT_MODEL_INPUT: ${{ inputs.chat_model }}
           CODEX_MODEL_INPUT: ${{ inputs.codex_model }}
+          CODEX_GH_TOKEN: ${{ github.token }}
+          EXTRA_INSTRUCTIONS: ${{ inputs.extra_instructions }}
+          EXTRA_COMMON_INSTRUCTIONS: ${{ inputs.extra_common_instructions }}
         run: |
           set -euo pipefail
 
           python3 - <<'PY'
           import json
           import os
+          import textwrap
           from pathlib import Path
 
           session_file = os.environ["SESSION_FILE"]
-          mode_input = (os.environ.get("MODE_INPUT", "") or "").strip().lower()
           prompt_text = (os.environ.get("PROMPT_TEXT", "") or "").strip()
           trigger_login = (os.environ.get("TRIGGER_LOGIN", "") or "").strip()
-          chat_model = (os.environ.get("CHAT_MODEL_INPUT", "") or "").strip()
           codex_model = (os.environ.get("CODEX_MODEL_INPUT", "") or "").strip()
+          github_token = (os.environ.get("CODEX_GH_TOKEN", "") or "").strip()
+          extra_instructions = (os.environ.get("EXTRA_INSTRUCTIONS", "") or "").strip()
+          extra_common_instructions = (os.environ.get("EXTRA_COMMON_INSTRUCTIONS", "") or "").strip()
 
           with open(session_file, "r", encoding="utf-8") as handle:
             payload = json.load(handle)
@@ -308,14 +322,14 @@ jobs:
           if not isinstance(session, dict):
             raise SystemExit("Session payload is invalid.")
 
-          mode = "codex" if mode_input == "codex" else "chat"
-          selected_model = codex_model if mode == "codex" else chat_model
+          selected_model = codex_model
           if not selected_model:
             raise SystemExit("No model selected for chat run.")
 
           repository = str(session.get("repository") or os.environ.get("GITHUB_REPOSITORY", "")).strip()
           session_key = str(session.get("session_key") or "").strip()
           ref_name = str(os.environ.get("GITHUB_REF_NAME") or "").strip()
+          workspace = os.environ.get("GITHUB_WORKSPACE", "")
           messages = session.get("messages") if isinstance(session.get("messages"), list) else []
 
           MAX_CONTEXT_MESSAGES = 30
@@ -356,11 +370,31 @@ jobs:
           if not prompt_text:
             raise SystemExit("Latest prompt text is empty.")
 
-          latest_message_matches_prompt = bool(
-            normalized_messages
-            and normalized_messages[-1]["role"] == "user"
-            and normalized_messages[-1]["content"] == prompt_text
+          def append_instruction_block(base: str, extra: str) -> str:
+            normalized_extra = (extra or "").strip()
+            if not normalized_extra:
+              return base
+            normalized_extra = textwrap.dedent(normalized_extra).strip()
+            if not normalized_extra:
+              return base
+            return base + "\n" + normalized_extra
+
+          repo_extra_instructions_path = (
+            Path(workspace) / ".github" / "codex-extra-instructions.md"
           )
+          if repo_extra_instructions_path.exists():
+            extra_instructions = append_instruction_block(
+              extra_instructions,
+              repo_extra_instructions_path.read_text(encoding="utf-8"),
+            )
+          repo_extra_common_instructions_path = (
+            Path(workspace) / ".github" / "codex-extra-common-instructions.md"
+          )
+          if repo_extra_common_instructions_path.exists():
+            extra_common_instructions = append_instruction_block(
+              extra_common_instructions,
+              repo_extra_common_instructions_path.read_text(encoding="utf-8"),
+            )
 
           transcript_lines = []
           newest_start_index = max(0, len(normalized_messages) - MAX_NEWEST_MESSAGES)
@@ -372,74 +406,66 @@ jobs:
               else truncate(message["content"], OLDER_MESSAGE_CHAR_LIMIT)
             )
             transcript_lines.append(f"{speaker}\n{content}")
-          transcript = "\n\n---\n\n".join(transcript_lines) if transcript_lines else "(no prior messages)"
+          comments_text = "\n\n---\n\n".join(transcript_lines) if transcript_lines else "(no comments)"
 
-          chat_standard_rules = [
-            "I use voice dictation; expect typos and confirm if ambiguous.",
-            "Don't guess & assume. If you're not sure what I mean, ask me.",
-            "If implementation intent is unclear, ask a clarifying question instead of editing.",
-            "You can update issue's description using gh. Do so as needed.",
-            "Do not make changes to the code. You can chat and analyze the code, GitHub, and workflows.",
-          ]
-          codex_standard_rules = [
-            "I use voice dictation; expect typos and confirm if ambiguous.",
-            "Don't guess & assume. If you're not sure what I mean, ask me.",
-            "If implementation intent is unclear, ask a clarifying question instead of editing.",
-            "Prefer deterministic, pure, functional code, with TDD.",
-            "Don't write flakey code that can break easily.",
-            "Refactor & reuse as needed to avoid duplicate code.",
-            "Commit only files relevant to the task. Do not include unrelated changes.",
-            "You can update issue's description using gh. Do so as needed.",
-            "Pass real newlines for PR bodies (via --body-file or a heredoc/printf).",
-          ]
+          codex_instructions = textwrap.dedent(
+            """\
+            * I use voice dictation; expect typos and confirm if ambiguous.
+            * Don't guess & assume. If you're not sure what I mean, ask me.
+            * If implementation intent is unclear, ask a clarifying question instead of editing.
+            * Prefer deterministic, pure, functional code, with TDD.
+            * Don't write flakey code that can break easily.
+            * Refactor & reuse as needed to avoid duplicate code.
+            * Commit only files relevant to the task. Do not include unrelated changes.
+            * You can update issue's description using gh. Do so as needed.
+            * Pass real newlines for PR bodies (via --body-file or a heredoc/printf).
+            """
+          ).strip()
+
+          common_instructions = textwrap.dedent(
+            f"""\
+            * To download attachments, use: `curl -H "Authorization: Bearer {github_token}" -L "<attachment-url>" -o "<filename>"`. Download one file at a time, use the exact format i provided, don't try to create a script to combine downloads or use tmp directories. Stick to a single file with that exact format.
+            """
+          ).strip()
+
+          codex_instructions = append_instruction_block(
+            codex_instructions,
+            extra_instructions,
+          )
+          common_instructions = append_instruction_block(
+            common_instructions,
+            extra_common_instructions,
+          )
+
           issue_instructions = (
             "If you made code changes, create a PR (make sure tests pass and link the issue in the PR description). "
             "If you made code changes but decide not to create a PR, push your WIP branch and mention its name in your response."
           )
-          common_rules = [
-            "You are responding in a Discord chat bridge session.",
-            "Respond with plain text only. Do not use markdown code fences unless the user asks.",
-            "Do not mention internal workflow details, secrets, or tokens.",
-            "Don't post comments on Github. To respond to the comment, our github workflow will automatically post your response to the Github as a comment.",
-            "Use the GitHub CLI (gh) to interact with GitHub (issues, PRs, comments).",
-          ]
-          if mode == "codex":
-            persona_line = "You are Codex. Give pragmatic engineering guidance with concise, direct steps."
-            mode_rules = codex_standard_rules
-            change_rules = issue_instructions
-          else:
-            persona_line = "You are Chat. Give clear, practical answers and ask a clarifying question only when needed."
-            mode_rules = chat_standard_rules
-            change_rules = ""
 
           trigger_line = f"Triggered by GitHub user: @{trigger_login}" if trigger_login else "Triggered by GitHub user: <unknown>"
-          trigger_message_block = (
-            "Trigger message:\n"
-            + f"{prompt_text}\n\n"
-            if not latest_message_matches_prompt
-            else ""
-          )
-          trigger_reference_line = (
-            "The newest User message in Latest messages is the trigger for this run."
-            if latest_message_matches_prompt
-            else "Use the Trigger message above as the request to answer."
-          )
           prompt = (
-            f"{persona_line}\n"
-            + "\n".join(f"- {rule}" for rule in mode_rules)
+            codex_instructions
             + "\n"
-            + "\n".join(f"- {rule}" for rule in common_rules)
-            + ("\n- " + change_rules if change_rules else "")
+            + common_instructions
+            + "\n\n"
+            + issue_instructions
+            + "\n\n"
+            + textwrap.dedent(
+              f"""\
+              * Don't post comments on Github. To respond to the user, our workflow will automatically post your response to Discord.
+              * Use the GitHub CLI (gh) to interact with GitHub (issues, PRs, comments).
+              * You're @codex. You were triggered by GitHub user: {f"@{trigger_login}" if trigger_login else "<unknown>"}.
+              """
+            ).strip()
             + "\n\n"
             + f"Repository: {repository}\n"
             + f"Session key: {session_key}\n"
             + f"Current branch: {ref_name or '<unknown>'}\n"
-            + f"{trigger_line}\n\n"
+            + f"{trigger_line}\n"
+            + "Active PR: none\n"
+            + f"Workspace: {workspace}\n\n"
             + "Latest messages (oldest to newest):\n"
-            + f"{transcript}\n\n"
-            + trigger_message_block
-            + f"{trigger_reference_line}\n\n"
-            + "Reply directly to the user request."
+            + f"{comments_text}\n"
           )
 
           prompt_path = Path(os.environ["GITHUB_WORKSPACE"]) / ".github" / "discord_chat_prompt.txt"
@@ -449,7 +475,7 @@ jobs:
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
             output.write(f"prompt_file={prompt_path}\n")
             output.write(f"model={selected_model}\n")
-            output.write(f"mode={mode}\n")
+            output.write("mode=codex\n")
             output.write(f"repository={repository}\n")
           PY
 
