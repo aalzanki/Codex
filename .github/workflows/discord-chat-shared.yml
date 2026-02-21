@@ -58,6 +58,8 @@ on:
         required: true
       CODEX_GITHUB_APP_PRIVATE_KEY:
         required: true
+      DISCORD_BOT_TOKEN:
+        required: true
 
 jobs:
   discord_chat:
@@ -305,11 +307,163 @@ jobs:
 
           echo "session_file=${SESSION_FILE}" >> "$GITHUB_OUTPUT"
 
+      - name: Fetch live Discord chat messages
+        id: live_context
+        shell: bash
+        env:
+          SESSION_FILE: ${{ steps.session.outputs.session_file }}
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          CONTEXT_FILE="${RUNNER_TEMP}/discord-chat-live-context.json"
+
+          python3 - <<'PY'
+          import json
+          import os
+          import urllib.error
+          import urllib.request
+
+          session_file = os.environ["SESSION_FILE"]
+          bot_token = (os.environ.get("DISCORD_BOT_TOKEN", "") or "").strip()
+          context_file = os.path.join(os.environ.get("RUNNER_TEMP", "/tmp"), "discord-chat-live-context.json")
+
+          if not bot_token:
+            raise SystemExit("DISCORD_BOT_TOKEN is required for live Discord context fetch.")
+
+          with open(session_file, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+          if not isinstance(payload, dict) or not payload.get("ok") or not payload.get("found"):
+            raise SystemExit("Chat session lookup failed before live context fetch.")
+
+          session = payload.get("session") or {}
+          if not isinstance(session, dict):
+            raise SystemExit("Invalid chat session payload.")
+
+          channel_id = str(session.get("channel_id") or "").strip()
+          discord_user_id = str(session.get("discord_user_id") or "").strip()
+          if not channel_id or not discord_user_id:
+            raise SystemExit("Session is missing channel_id or discord_user_id.")
+
+          request = urllib.request.Request(
+            f"https://discord.com/api/v10/channels/{channel_id}/messages?limit=100",
+            headers={
+              "Authorization": f"Bot {bot_token}",
+              "Accept": "application/json",
+            },
+            method="GET",
+          )
+          try:
+            with urllib.request.urlopen(request) as response:
+              status = int(response.getcode() or 0)
+              body = response.read().decode("utf-8", errors="replace")
+          except urllib.error.HTTPError as error:
+            details = error.read().decode("utf-8", errors="replace")
+            raise SystemExit(
+              f"Discord API request failed ({error.code}): {details[:500]}"
+            )
+
+          if status != 200:
+            raise SystemExit(f"Discord API request failed with status {status}.")
+
+          parsed = json.loads(body)
+          if not isinstance(parsed, list):
+            raise SystemExit("Discord API did not return a messages array.")
+
+          def snowflake_as_int(value: str) -> int:
+            text = str(value or "").strip()
+            if not text:
+              return -1
+            try:
+              return int(text)
+            except Exception:
+              return -1
+
+          def display_name_from_message(message):
+            member = message.get("member") if isinstance(message, dict) else {}
+            if isinstance(member, dict):
+              nick = str(member.get("nick") or "").strip()
+              if nick:
+                return nick
+            author = message.get("author") if isinstance(message, dict) else {}
+            if isinstance(author, dict):
+              for key in ("global_name", "display_name", "username"):
+                candidate = str(author.get(key) or "").strip()
+                if candidate:
+                  return candidate
+            return ""
+
+          sorted_messages = sorted(
+            (item for item in parsed if isinstance(item, dict)),
+            key=lambda item: snowflake_as_int(item.get("id")),
+          )
+
+          normalized_messages = []
+          user_display_name = str(session.get("user_display_name") or "").strip()
+
+          for message in sorted_messages:
+            author = message.get("author") if isinstance(message.get("author"), dict) else {}
+            author_id = str(author.get("id") or "").strip()
+            role = ""
+            if author_id and author_id == discord_user_id:
+              role = "user"
+              if not user_display_name:
+                user_display_name = display_name_from_message(message)
+            elif bool(author.get("bot")):
+              role = "assistant"
+            else:
+              continue
+
+            content = str(message.get("content") or "").strip()
+            attachments = message.get("attachments") if isinstance(message.get("attachments"), list) else []
+            attachment_urls = []
+            for attachment in attachments:
+              if not isinstance(attachment, dict):
+                continue
+              url = str(attachment.get("url") or "").strip()
+              if url:
+                attachment_urls.append(url)
+
+            lines = []
+            if content:
+              lines.append(content)
+            if attachment_urls:
+              if lines:
+                lines.append("")
+              lines.extend(attachment_urls)
+
+            merged_content = "\n".join(lines).strip()
+            if not merged_content:
+              continue
+
+            normalized_messages.append(
+              {
+                "role": role,
+                "content": merged_content,
+                "discord_message_id": str(message.get("id") or "").strip(),
+              }
+            )
+
+          with open(context_file, "w", encoding="utf-8") as handle:
+            json.dump(
+              {
+                "messages": normalized_messages,
+                "user_display_name": user_display_name,
+              },
+              handle,
+              ensure_ascii=False,
+            )
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+            output.write(f"context_file={context_file}\n")
+          PY
+
       - name: Build Codex chat prompt
         id: prompt
         shell: bash
         env:
           SESSION_FILE: ${{ steps.session.outputs.session_file }}
+          LIVE_CONTEXT_FILE: ${{ steps.live_context.outputs.context_file }}
           PROMPT_TEXT: ${{ inputs.prompt_text }}
           TRIGGER_LOGIN: ${{ inputs.trigger_login }}
           DISCORD_USER_ID: ${{ inputs.discord_user_id }}
@@ -326,6 +480,7 @@ jobs:
           from pathlib import Path
 
           session_file = os.environ["SESSION_FILE"]
+          live_context_file = (os.environ.get("LIVE_CONTEXT_FILE", "") or "").strip()
           prompt_text = (os.environ.get("PROMPT_TEXT", "") or "").strip()
           trigger_login = (os.environ.get("TRIGGER_LOGIN", "") or "").strip()
           discord_user_id = (os.environ.get("DISCORD_USER_ID", "") or "").strip()
@@ -354,7 +509,20 @@ jobs:
           ref_name = str(os.environ.get("GITHUB_REF_NAME") or "").strip()
           workspace = os.environ.get("GITHUB_WORKSPACE", "")
           discord_user_name = str(session.get("user_display_name") or "").strip()
-          messages = session.get("messages") if isinstance(session.get("messages"), list) else []
+          messages = []
+          if live_context_file:
+            try:
+              with open(live_context_file, "r", encoding="utf-8") as handle:
+                live_context = json.load(handle)
+              if isinstance(live_context, dict):
+                maybe_name = str(live_context.get("user_display_name") or "").strip()
+                if maybe_name:
+                  discord_user_name = maybe_name
+                raw_live_messages = live_context.get("messages")
+                if isinstance(raw_live_messages, list):
+                  messages = raw_live_messages
+            except Exception:
+              messages = []
 
           MAX_CONTEXT_MESSAGES = 30
           MAX_NEWEST_MESSAGES = 2
