@@ -58,6 +58,11 @@ on:
         required: false
         type: string
         default: "gpt-5.2"
+    secrets:
+      CODEX_GITHUB_APP_ID:
+        required: true
+      CODEX_GITHUB_APP_PRIVATE_KEY:
+        required: true
 
 jobs:
   discord_chat:
@@ -112,6 +117,13 @@ jobs:
             echo "prompt_text input is required"
             exit 1
           fi
+
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.CODEX_GITHUB_APP_ID }}
+          private-key: ${{ secrets.CODEX_GITHUB_APP_PRIVATE_KEY }}
 
       - name: Checkout target branch (self-hosted)
         shell: bash
@@ -264,6 +276,18 @@ jobs:
 
           echo "codex_path=$CODEX_PATH" >> "$GITHUB_OUTPUT"
           echo "Found codex executable: $CODEX_PATH"
+
+      - name: Configure git identity
+        shell: bash
+        env:
+          CODEX_GIT_USER_NAME: ${{ vars.CODEX_GIT_USER_NAME }}
+          CODEX_GIT_USER_EMAIL: ${{ vars.CODEX_GIT_USER_EMAIL }}
+        run: |
+          set -euo pipefail
+
+          cd "${GITHUB_WORKSPACE}"
+          git config user.name "${CODEX_GIT_USER_NAME:-${GITHUB_ACTOR}}"
+          git config user.email "${CODEX_GIT_USER_EMAIL:-${GITHUB_ACTOR}@users.noreply.github.com}"
 
       - name: Fetch chat session context
         id: session
@@ -503,9 +527,9 @@ jobs:
           CODEX_PATH: ${{ steps.exes.outputs.codex_path }}
           PROMPT_FILE: ${{ steps.prompt.outputs.prompt_file }}
           CODEX_MODEL: ${{ steps.prompt.outputs.model }}
-          GITHUB_TOKEN: ${{ github.token }}
-          GH_TOKEN: ${{ github.token }}
-          CODEX_GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          CODEX_GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           set -euo pipefail
 
