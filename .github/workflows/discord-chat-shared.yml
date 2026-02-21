@@ -335,6 +335,7 @@ jobs:
           session_key = str(session.get("session_key") or "").strip()
           ref_name = str(os.environ.get("GITHUB_REF_NAME") or "").strip()
           workspace = os.environ.get("GITHUB_WORKSPACE", "")
+          discord_user_name = str(session.get("user_display_name") or "").strip()
           messages = session.get("messages") if isinstance(session.get("messages"), list) else []
 
           MAX_CONTEXT_MESSAGES = 30
@@ -403,8 +404,9 @@ jobs:
 
           transcript_lines = []
           newest_start_index = max(0, len(normalized_messages) - MAX_NEWEST_MESSAGES)
+          human_speaker = discord_user_name or "User"
           for index, message in enumerate(normalized_messages):
-            speaker = "User" if message["role"] == "user" else "Assistant"
+            speaker = human_speaker if message["role"] == "user" else "Codex"
             content = (
               message["content"]
               if index >= newest_start_index
@@ -449,7 +451,11 @@ jobs:
 
           discord_user_display = f"<@{discord_user_id}>" if discord_user_id else "<unknown>"
           linked_github_display = f"@{trigger_login}" if trigger_login else "<none>"
-          trigger_line = f"Triggered by Discord user: {discord_user_display}"
+          trigger_line = (
+            f"Triggered by Discord user: {discord_user_name} ({discord_user_display})"
+            if discord_user_name
+            else f"Triggered by Discord user: {discord_user_display}"
+          )
           prompt = (
             codex_instructions
             + "\n"
@@ -461,7 +467,7 @@ jobs:
               f"""\
               * Don't post comments on Github. To respond to the user, our workflow will automatically post your response to Discord.
               * Use the GitHub CLI (gh) to interact with GitHub (issues, PRs, comments).
-              * You're @codex. You were triggered by Discord user: {discord_user_display}.
+              * You're @codex. You were triggered by Discord user: {discord_user_name or '<unknown>'} ({discord_user_display}).
               * The linked GitHub user for this Discord session is: {linked_github_display}.
               """
             ).strip()
@@ -470,6 +476,7 @@ jobs:
             + f"Session key: {session_key}\n"
             + f"Current branch: {ref_name or '<unknown>'}\n"
             + f"{trigger_line}\n"
+            + f"Discord user name: {discord_user_name or '<unknown>'}\n"
             + f"Linked GitHub user: {linked_github_display}\n"
             + "Active PR: none\n"
             + f"Workspace: {workspace}\n\n"
