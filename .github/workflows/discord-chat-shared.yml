@@ -312,6 +312,35 @@ jobs:
               return selectActiveIssueLinkedPullRequest(issueNode);
             };
 
+            const resolveDefaultBranch = async () => {
+              const repo = await github.rest.repos.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+              });
+              return String(repo.data?.default_branch || '').trim();
+            };
+
+            const doesBranchExist = async (branchName) => {
+              const normalizedBranch = String(branchName || '').trim();
+              if (!normalizedBranch) {
+                return false;
+              }
+              try {
+                await github.rest.repos.getBranch({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  branch: normalizedBranch,
+                });
+                return true;
+              } catch (error) {
+                const status = Number(error?.status || error?.response?.status || 0);
+                if (status === 404) {
+                  return false;
+                }
+                throw error;
+              }
+            };
+
             const sessionFile = String(process.env.SESSION_FILE || '').trim();
             if (!sessionFile) {
               core.setFailed('SESSION_FILE is required.');
@@ -368,12 +397,27 @@ jobs:
               }
             }
 
+            if (branch) {
+              try {
+                const branchExists = await doesBranchExist(branch);
+                if (!branchExists) {
+                  core.warning(
+                    `Resolved branch '${branch}' does not exist on origin; falling back to default branch.`
+                  );
+                  branch = '';
+                  activePrNumber = '';
+                  activePrUrl = '';
+                }
+              } catch (error) {
+                core.warning(
+                  `Unable to verify branch '${branch}'; proceeding with fallback branch resolution: ${error.message}`
+                );
+                branch = '';
+              }
+            }
+
             if (!branch) {
-              const repo = await github.rest.repos.get({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-              });
-              branch = repo.data.default_branch;
+              branch = await resolveDefaultBranch();
             }
 
             core.setOutput('branch', branch || '');
