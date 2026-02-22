@@ -864,7 +864,6 @@ jobs:
           CODEX_MODEL: ${{ steps.prompt.outputs.model }}
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          CODEX_GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           set -euo pipefail
 
