@@ -54,9 +54,7 @@ on:
         type: string
         default: ""
     secrets:
-      CODEX_GITHUB_APP_ID:
-        required: true
-      CODEX_GITHUB_APP_PRIVATE_KEY:
+      CODEX_GH_TOKEN:
         required: true
 
 jobs:
@@ -112,13 +110,6 @@ jobs:
             echo "prompt_text input is required"
             exit 1
           fi
-
-      - name: Generate GitHub App token
-        id: app-token
-        uses: actions/create-github-app-token@v1
-        with:
-          app-id: ${{ secrets.CODEX_GITHUB_APP_ID }}
-          private-key: ${{ secrets.CODEX_GITHUB_APP_PRIVATE_KEY }}
 
       - name: Fetch chat session context
         id: session
@@ -862,8 +853,9 @@ jobs:
           CODEX_PATH: ${{ steps.exes.outputs.codex_path }}
           PROMPT_FILE: ${{ steps.prompt.outputs.prompt_file }}
           CODEX_MODEL: ${{ steps.prompt.outputs.model }}
-          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GITHUB_TOKEN: ${{ secrets.CODEX_GH_TOKEN }}
+          GH_TOKEN: ${{ secrets.CODEX_GH_TOKEN }}
+          CODEX_GH_TOKEN: ${{ secrets.CODEX_GH_TOKEN }}
         run: |
           set -euo pipefail
 
