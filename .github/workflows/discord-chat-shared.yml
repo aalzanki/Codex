@@ -623,7 +623,6 @@ jobs:
 
           session_file = os.environ["SESSION_FILE"]
           prompt_text = (os.environ.get("PROMPT_TEXT", "") or "").strip()
-          trigger_login = (os.environ.get("TRIGGER_LOGIN", "") or "").strip()
           discord_user_id = (os.environ.get("DISCORD_USER_ID", "") or "").strip()
           target_branch = (os.environ.get("TARGET_BRANCH", "") or "").strip()
           active_pr_number = (os.environ.get("ACTIVE_PR_NUMBER", "") or "").strip()
@@ -652,7 +651,6 @@ jobs:
           session_key = str(session.get("session_key") or "").strip()
           ref_name = target_branch or str(os.environ.get("GITHUB_REF_NAME") or "").strip()
           workspace = os.environ.get("GITHUB_WORKSPACE", "")
-          discord_user_name = str(session.get("user_display_name") or "").strip()
           thread_issue_type = str(session.get("issue_type") or "").strip().lower()
           thread_issue_number_raw = str(session.get("issue_number") or "").strip()
           thread_url = str(session.get("thread_url") or "").strip()
@@ -681,13 +679,24 @@ jobs:
             content = str(message.get("content") or "").strip()
             if role not in ("user", "assistant") or not content:
               continue
-            normalized_messages.append({"role": role, "content": content})
+            speaker_name = str(message.get("speaker_name") or "").strip()
+            speaker_id = str(message.get("speaker_id") or "").strip()
+            normalized_messages.append(
+              {
+                "role": role,
+                "content": content,
+                "speaker_name": speaker_name,
+                "speaker_id": speaker_id,
+              }
+            )
           deduped_messages = []
           for message in normalized_messages:
             if (
               deduped_messages
               and deduped_messages[-1]["role"] == message["role"]
               and deduped_messages[-1]["content"] == message["content"]
+              and deduped_messages[-1].get("speaker_name", "") == message.get("speaker_name", "")
+              and deduped_messages[-1].get("speaker_id", "") == message.get("speaker_id", "")
             ):
               continue
             deduped_messages.append(message)
@@ -729,9 +738,10 @@ jobs:
 
           transcript_lines = []
           newest_start_index = max(0, len(normalized_messages) - MAX_NEWEST_MESSAGES)
-          human_speaker = discord_user_name or "User"
           for index, message in enumerate(normalized_messages):
-            speaker = human_speaker if message["role"] == "user" else "Codex"
+            speaker = str(message.get("speaker_name") or "").strip()
+            if not speaker:
+              speaker = "User" if message["role"] == "user" else "Codex"
             content = (
               message["content"]
               if index >= newest_start_index
@@ -775,7 +785,21 @@ jobs:
           )
 
           discord_user_display = f"<@{discord_user_id}>" if discord_user_id else "<unknown>"
-          linked_github_display = f"@{trigger_login}" if trigger_login else "<none>"
+          trigger_user_name = ""
+          if discord_user_id:
+            for message in reversed(normalized_messages):
+              if (
+                message.get("role") == "user"
+                and str(message.get("speaker_id") or "").strip() == discord_user_id
+              ):
+                trigger_user_name = str(message.get("speaker_name") or "").strip()
+                break
+          if not trigger_user_name:
+            for message in reversed(normalized_messages):
+              if message.get("role") == "user":
+                trigger_user_name = str(message.get("speaker_name") or "").strip()
+                if trigger_user_name:
+                  break
           thread_context_line = "Thread context: none"
           if thread_issue_number > 0 and thread_issue_type in ("issue", "pull_request"):
             issue_label = "PR" if thread_issue_type == "pull_request" else "Issue"
@@ -788,8 +812,8 @@ jobs:
             if active_pr_url:
               active_pr_line += f" ({active_pr_url})"
           trigger_line = (
-            f"Triggered by Discord user: {discord_user_name} ({discord_user_display})"
-            if discord_user_name
+            f"Triggered by Discord user: {trigger_user_name} ({discord_user_display})"
+            if trigger_user_name
             else f"Triggered by Discord user: {discord_user_display}"
           )
           prompt = (
@@ -803,8 +827,8 @@ jobs:
               f"""\
               * Don't post comments on Github. To respond to the user, our workflow will automatically post your response to Discord.
               * Use the GitHub CLI (gh) to interact with GitHub (issues, PRs, comments).
-              * You're @codex. You were triggered by Discord user: {discord_user_name or '<unknown>'} ({discord_user_display}).
-              * The linked GitHub user for this Discord session is: {linked_github_display}.
+              * You're @codex. You were triggered by Discord user: {trigger_user_name or '<unknown>'} ({discord_user_display}).
+              * Discord channel permissions are the source of access control for this session.
               """
             ).strip()
             + "\n\n"
@@ -812,8 +836,6 @@ jobs:
             + f"Session key: {session_key}\n"
             + f"Current branch: {ref_name or '<unknown>'}\n"
             + f"{trigger_line}\n"
-            + f"Discord user name: {discord_user_name or '<unknown>'}\n"
-            + f"Linked GitHub user: {linked_github_display}\n"
             + f"{thread_context_line}\n"
             + f"{active_pr_line}\n"
             + f"Workspace: {workspace}\n\n"
