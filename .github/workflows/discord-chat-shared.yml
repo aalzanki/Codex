@@ -834,7 +834,6 @@ jobs:
           common_instructions = textwrap.dedent(
             """\
             * To download attachments from Discord messages, use: `curl -L "<attachment-url>" -o "<filename>"`. Download one file at a time, use the exact format i provided, don't try to create a script to combine downloads or use tmp directories. Stick to a single file with that exact format.
-            * For voice-note/audio transcription, run this exact command (English + turbo model on Apple GPU): `whisper "<audio-file>" --model turbo --language en --task transcribe --device mps --fp16 False --output_format txt --output_dir . --verbose False`. Always use this exact command unless I explicitly ask for a different model/settings.
             """
           ).strip()
 
