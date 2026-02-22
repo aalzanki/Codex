@@ -2229,7 +2229,7 @@ jobs:
             core.info('Discord bridge notification enabled; destination routing is resolved by bridge.');
 
       - name: Post Discord bridge event
-        if: ${{ always() && inputs.discord_bridge_url != '' && steps.post_response.outputs.comment_url != '' && steps.discord_channel.outputs.notify_discord == 'true' }}
+        if: ${{ false && always() && inputs.discord_bridge_url != '' && steps.post_response.outputs.comment_url != '' && steps.discord_channel.outputs.notify_discord == 'true' }}
         shell: bash
         env:
           DISCORD_BRIDGE_URL: ${{ inputs.discord_bridge_url }}
@@ -2361,7 +2361,7 @@ jobs:
             handle.write(delivery_id)
           PY
       - name: Deliver Discord bridge event
-        if: ${{ always() && inputs.discord_bridge_url != '' && steps.post_response.outputs.comment_url != '' && steps.discord_channel.outputs.notify_discord == 'true' }}
+        if: ${{ false && always() && inputs.discord_bridge_url != '' && steps.post_response.outputs.comment_url != '' && steps.discord_channel.outputs.notify_discord == 'true' }}
         shell: bash
         env:
           DISCORD_BRIDGE_URL: ${{ inputs.discord_bridge_url }}
@@ -2434,7 +2434,7 @@ jobs:
 
       - name: Resolve Discord webhook for trigger user
         id: discord_webhook
-        if: always()
+        if: ${{ false }}
         uses: actions/github-script@v7
         env:
           TRIGGER_LOGIN: ${{ steps.prompt.outputs.trigger_login }}
@@ -2548,7 +2548,7 @@ jobs:
             core.info(`Discord webhook resolved for @${triggerLogin}.`);
 
       - name: Post Discord completion notification
-        if: ${{ always() && inputs.discord_bridge_url == '' && steps.discord_webhook.outputs.notify_discord == 'true' && steps.post_response.outputs.comment_url != '' && steps.post_response.outputs.discord_preview != '' }}
+        if: ${{ false && always() && inputs.discord_bridge_url == '' && steps.discord_webhook.outputs.notify_discord == 'true' && steps.post_response.outputs.comment_url != '' && steps.post_response.outputs.discord_preview != '' }}
         shell: bash
         env:
           DISCORD_WEBHOOK_URL: ${{ steps.discord_webhook.outputs.webhook_url }}
