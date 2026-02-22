@@ -1121,3 +1121,34 @@ jobs:
             -H "Content-Type: application/json" \
             --data-binary @"${PAYLOAD_FILE}" \
             "${WORKER_URL%/}/chat/session/respond" >/dev/null
+
+      - name: Clear eyes reaction for cancelled run
+        if: ${{ cancelled() }}
+        continue-on-error: true
+        shell: bash
+        env:
+          WORKER_URL: ${{ inputs.worker_url }}
+          CHAT_SESSION_KEY: ${{ inputs.chat_session_key }}
+          CHAT_SESSION_TOKEN: ${{ inputs.chat_session_token }}
+        run: |
+          set -euo pipefail
+
+          PAYLOAD_FILE="${RUNNER_TEMP}/discord-chat-cancel.json"
+          python3 - <<'PY' > "${PAYLOAD_FILE}"
+          import json
+          import os
+
+          payload = {
+            "session_key": (os.environ.get("CHAT_SESSION_KEY", "") or "").strip(),
+            "token": (os.environ.get("CHAT_SESSION_TOKEN", "") or "").strip(),
+          }
+          print(json.dumps(payload, ensure_ascii=False))
+          PY
+
+          if ! curl -fsS \
+            -X POST \
+            -H "Content-Type: application/json" \
+            --data-binary @"${PAYLOAD_FILE}" \
+            "${WORKER_URL%/}/chat/session/cancel" >/dev/null; then
+            echo "::warning::Failed to clear Discord eyes reaction for cancelled run."
+          fi
