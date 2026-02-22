@@ -53,9 +53,49 @@ on:
         required: false
         type: string
         default: ""
+      extra_env:
+        description: "Optional newline-separated KEY=VALUE pairs injected into the Codex runtime environment (non-secret values only)."
+        required: false
+        type: string
+        default: ""
+      extra_secret_env_1_name:
+        description: "Optional environment variable name for secrets.EXTRA_SECRET_ENV_1."
+        required: false
+        type: string
+        default: ""
+      extra_secret_env_2_name:
+        description: "Optional environment variable name for secrets.EXTRA_SECRET_ENV_2."
+        required: false
+        type: string
+        default: ""
+      extra_secret_env_3_name:
+        description: "Optional environment variable name for secrets.EXTRA_SECRET_ENV_3."
+        required: false
+        type: string
+        default: ""
+      extra_secret_env_4_name:
+        description: "Optional environment variable name for secrets.EXTRA_SECRET_ENV_4."
+        required: false
+        type: string
+        default: ""
+      extra_secret_env_5_name:
+        description: "Optional environment variable name for secrets.EXTRA_SECRET_ENV_5."
+        required: false
+        type: string
+        default: ""
     secrets:
       CODEX_GH_TOKEN:
         required: true
+      EXTRA_SECRET_ENV_1:
+        required: false
+      EXTRA_SECRET_ENV_2:
+        required: false
+      EXTRA_SECRET_ENV_3:
+        required: false
+      EXTRA_SECRET_ENV_4:
+        required: false
+      EXTRA_SECRET_ENV_5:
+        required: false
 
 jobs:
   discord_chat:
@@ -892,6 +932,17 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.CODEX_GH_TOKEN }}
           GH_TOKEN: ${{ secrets.CODEX_GH_TOKEN }}
           CODEX_GH_TOKEN: ${{ secrets.CODEX_GH_TOKEN }}
+          CODEX_EXTRA_ENV: ${{ inputs.extra_env }}
+          CODEX_EXTRA_SECRET_ENV_1_NAME: ${{ inputs.extra_secret_env_1_name }}
+          CODEX_EXTRA_SECRET_ENV_2_NAME: ${{ inputs.extra_secret_env_2_name }}
+          CODEX_EXTRA_SECRET_ENV_3_NAME: ${{ inputs.extra_secret_env_3_name }}
+          CODEX_EXTRA_SECRET_ENV_4_NAME: ${{ inputs.extra_secret_env_4_name }}
+          CODEX_EXTRA_SECRET_ENV_5_NAME: ${{ inputs.extra_secret_env_5_name }}
+          CODEX_EXTRA_SECRET_ENV_1_VALUE: ${{ secrets.EXTRA_SECRET_ENV_1 }}
+          CODEX_EXTRA_SECRET_ENV_2_VALUE: ${{ secrets.EXTRA_SECRET_ENV_2 }}
+          CODEX_EXTRA_SECRET_ENV_3_VALUE: ${{ secrets.EXTRA_SECRET_ENV_3 }}
+          CODEX_EXTRA_SECRET_ENV_4_VALUE: ${{ secrets.EXTRA_SECRET_ENV_4 }}
+          CODEX_EXTRA_SECRET_ENV_5_VALUE: ${{ secrets.EXTRA_SECRET_ENV_5 }}
         run: |
           set -euo pipefail
 
@@ -907,6 +958,88 @@ jobs:
             echo "ERROR: selected model is empty"
             exit 1
           fi
+
+          is_valid_env_key() {
+            local key="$1"
+            [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]
+          }
+
+          export_env_kv() {
+            local key="$1"
+            local value="$2"
+
+            if ! is_valid_env_key "$key"; then
+              echo "ERROR: invalid env var name: ${key}"
+              exit 1
+            fi
+
+            export "${key}=${value}"
+          }
+
+          apply_extra_env_multiline() {
+            local payload="$1"
+            local label="$2"
+
+            if [ -z "$payload" ]; then
+              return 0
+            fi
+
+            local line_no=0
+            while IFS= read -r line || [ -n "$line" ]; do
+              line_no=$((line_no + 1))
+              line="${line%$'\\r'}"
+              if [ -z "$line" ]; then
+                continue
+              fi
+              case "$line" in
+                \#*) continue ;;
+              esac
+              if [[ "$line" != *"="* ]]; then
+                echo "ERROR: ${label} expects KEY=VALUE lines (invalid line ${line_no})"
+                exit 1
+              fi
+
+              local key="${line%%=*}"
+              local value="${line#*=}"
+
+              if [ -z "$key" ]; then
+                echo "ERROR: ${label} contains an empty key (line ${line_no})"
+                exit 1
+              fi
+
+              export_env_kv "$key" "$value"
+            done <<< "$payload"
+          }
+
+          apply_secret_slot() {
+            local slot="$1"
+            local key="$2"
+            local value="$3"
+
+            if [ -z "$key" ] && [ -z "$value" ]; then
+              return 0
+            fi
+            if [ -z "$key" ]; then
+              echo "ERROR: extra secret env slot ${slot} has a value but no name (inputs.extra_secret_env_${slot}_name)"
+              exit 1
+            fi
+            if [ -z "$value" ]; then
+              echo "ERROR: extra secret env slot ${slot} name is set but secrets.EXTRA_SECRET_ENV_${slot} is empty/not provided"
+              exit 1
+            fi
+
+            export_env_kv "$key" "$value"
+          }
+
+          # Optional injection of additional environment variables for custom tasks/tools.
+          # - inputs.extra_env is for non-secret values.
+          # - secrets.EXTRA_SECRET_ENV_N are for secret values, exported to the env var name provided by inputs.extra_secret_env_N_name.
+          apply_extra_env_multiline "${CODEX_EXTRA_ENV:-}" "inputs.extra_env"
+          apply_secret_slot "1" "${CODEX_EXTRA_SECRET_ENV_1_NAME:-}" "${CODEX_EXTRA_SECRET_ENV_1_VALUE:-}"
+          apply_secret_slot "2" "${CODEX_EXTRA_SECRET_ENV_2_NAME:-}" "${CODEX_EXTRA_SECRET_ENV_2_VALUE:-}"
+          apply_secret_slot "3" "${CODEX_EXTRA_SECRET_ENV_3_NAME:-}" "${CODEX_EXTRA_SECRET_ENV_3_VALUE:-}"
+          apply_secret_slot "4" "${CODEX_EXTRA_SECRET_ENV_4_NAME:-}" "${CODEX_EXTRA_SECRET_ENV_4_VALUE:-}"
+          apply_secret_slot "5" "${CODEX_EXTRA_SECRET_ENV_5_NAME:-}" "${CODEX_EXTRA_SECRET_ENV_5_VALUE:-}"
 
           TASK="$(cat "${PROMPT_FILE}")"
           OUTPUT_FILE="${GITHUB_WORKSPACE}/.github/discord_chat_output.txt"
