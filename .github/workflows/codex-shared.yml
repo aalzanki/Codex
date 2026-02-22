@@ -2209,7 +2209,7 @@ jobs:
 
       - name: Resolve Discord channel for trigger user
         id: discord_channel
-        if: ${{ always() && inputs.discord_bridge_url != '' }}
+        if: ${{ false && inputs.discord_bridge_url != '' }}
         uses: actions/github-script@v7
         env:
           TRIGGER_LOGIN: ${{ steps.prompt.outputs.trigger_login }}
