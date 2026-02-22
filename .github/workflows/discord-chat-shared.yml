@@ -672,24 +672,27 @@ jobs:
               continue
             speaker_name = str(message.get("speaker_name") or "").strip()
             speaker_id = str(message.get("speaker_id") or "").strip()
+            discord_message_id = str(message.get("discord_message_id") or "").strip()
             normalized_messages.append(
               {
                 "role": role,
                 "content": content,
                 "speaker_name": speaker_name,
                 "speaker_id": speaker_id,
+                "discord_message_id": discord_message_id,
               }
             )
+
+          # Keep only true duplicates by Discord message id. Do not collapse
+          # repeated user content ("continue", etc.) because each message matters.
           deduped_messages = []
+          seen_message_ids = set()
           for message in normalized_messages:
-            if (
-              deduped_messages
-              and deduped_messages[-1]["role"] == message["role"]
-              and deduped_messages[-1]["content"] == message["content"]
-              and deduped_messages[-1].get("speaker_name", "") == message.get("speaker_name", "")
-              and deduped_messages[-1].get("speaker_id", "") == message.get("speaker_id", "")
-            ):
+            message_id = str(message.get("discord_message_id") or "").strip()
+            if message_id and message_id in seen_message_ids:
               continue
+            if message_id:
+              seen_message_ids.add(message_id)
             deduped_messages.append(message)
           normalized_messages = deduped_messages[-MAX_CONTEXT_MESSAGES:]
 
@@ -700,6 +703,39 @@ jobs:
                 break
           if not prompt_text:
             raise SystemExit("Latest prompt text is empty.")
+
+          # Guarantee the exact triggering prompt is present in context,
+          # even if live message fetch is momentarily stale.
+          has_exact_trigger_prompt = False
+          for message in reversed(normalized_messages):
+            if message["role"] != "user":
+              continue
+            same_user = True
+            if discord_user_id:
+              same_user = str(message.get("speaker_id") or "").strip() == discord_user_id
+            if same_user and message["content"] == prompt_text:
+              has_exact_trigger_prompt = True
+              break
+          if not has_exact_trigger_prompt:
+            trigger_speaker_name = ""
+            for message in reversed(normalized_messages):
+              if message["role"] != "user":
+                continue
+              if discord_user_id and str(message.get("speaker_id") or "").strip() != discord_user_id:
+                continue
+              trigger_speaker_name = str(message.get("speaker_name") or "").strip()
+              if trigger_speaker_name:
+                break
+            normalized_messages.append(
+              {
+                "role": "user",
+                "content": prompt_text,
+                "speaker_name": trigger_speaker_name,
+                "speaker_id": discord_user_id,
+                "discord_message_id": "",
+              }
+            )
+            normalized_messages = normalized_messages[-MAX_CONTEXT_MESSAGES:]
 
           def append_instruction_block(base: str, extra: str) -> str:
             normalized_extra = (extra or "").strip()
